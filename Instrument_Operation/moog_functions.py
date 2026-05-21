@@ -11,6 +11,7 @@ Acknowledgement: Sierra Macleod
 #Import Libraries
 import serial
 import time
+import json
 from enum import IntEnum
 
 # Define constants
@@ -124,7 +125,10 @@ class GenStatus:
 
 
 class BasicResponse:
-    def __init__(self, data: list):
+    def __init__(self, data: list, raw_bytes=None, unescaped_bytes=None):
+        self.raw_bytes = list(raw_bytes) if raw_bytes is not None else []
+        self.unescaped_bytes = list(unescaped_bytes) if unescaped_bytes is not None else []
+
         self.pan_coord = (bytes_to_int(data.pop(0), data.pop(0))) / 10   # PAN = -3600 to +3600 = -360.0 deg to +360.0 deg
         self.tilt_coord =  (bytes_to_int(data.pop(0), data.pop(0))) / 10  # TILT = -1800 to +1800 = -180.0 deg to +180.0 deg
         
@@ -162,7 +166,40 @@ class BasicResponse:
                 'Tilt coord: {tilt_coord} deg\n').format(pan_coord=self.pan_coord,
                                               tilt_coord=self.tilt_coord)
 
-        
+
+def is_move_complete(status):
+    moving = status.gen_status.executing or status.gen_status.moving_cw or status.gen_status.moving_ccw or status.gen_status.moving_up or status.gen_status.moving_down
+    return int(not moving)
+
+
+def write_moog_status_attrs(attrs, status, target_pan_deg, target_tilt_deg):
+    attrs['Moog Target Pan [deg]'] = float(target_pan_deg)
+    attrs['Moog Target Tilt [deg]'] = float(target_tilt_deg)
+    attrs['Moog Actual Pan [deg]'] = float(status.pan_coord)
+    attrs['Moog Actual Tilt [deg]'] = float(status.tilt_coord)
+    attrs['Moog Pan Error [deg]'] = float(status.pan_coord - target_pan_deg)
+    attrs['Moog Tilt Error [deg]'] = float(status.tilt_coord - target_tilt_deg)
+    attrs['Moog Move Complete'] = is_move_complete(status)
+    attrs['Moog Status Raw Bytes'] = status.raw_bytes
+    attrs['Moog EXEC Bit'] = int(status.gen_status.executing)
+    attrs['Moog Moving Bits'] = json.dumps({
+        'cw': int(status.gen_status.moving_cw),
+        'ccw': int(status.gen_status.moving_ccw),
+        'up': int(status.gen_status.moving_up),
+        'down': int(status.gen_status.moving_down),
+    })
+    attrs['Moog Soft Limit Bits'] = json.dumps({
+        'pan_cw': int(status.pan_status.cw_soft_lim),
+        'pan_ccw': int(status.pan_status.ccw_soft_lim),
+        'tilt_up': int(status.tilt_status.up_soft_lim),
+        'tilt_down': int(status.tilt_status.down_soft_lim),
+    })
+    attrs['Moog Hard Limit Bits'] = json.dumps({
+        'pan_cw': int(status.pan_status.cw_hard_lim),
+        'pan_ccw': int(status.pan_status.ccw_hard_lim),
+        'tilt_up': int(status.tilt_status.up_hard_lim),
+        'tilt_down': int(status.tilt_status.down_hard_lim),
+    })
 
 
 
@@ -282,8 +319,9 @@ def get_status_jog(serial_port,
                                                           lrc_match='YES' if lrc_matches else 'NO',
                                                           data=[hex(x) for x in rsp_data]))
 
-    formatted_resp = BasicResponse(rsp_data)
+    formatted_resp = BasicResponse(rsp_data, raw_bytes=response_raw, unescaped_bytes=response)
     print(formatted_resp)
+    return formatted_resp
     
 def keep_alive(serial_port,
                    get_response=True,

@@ -200,8 +200,11 @@ class DataCollectorApp:
             pan = np.degrees(sun_pos['azimuth'])
             tilt = np.degrees(sun_pos['altitude']) + dtilt
 
-            mf.mv_to_coord(moog, int((pan - pan_offset) * 10), int((tilt - tilt_offset) * 10))
+            moog_target_pan = pan - pan_offset
+            moog_target_tilt = tilt - tilt_offset
+            mf.mv_to_coord(moog, int(moog_target_pan * 10), int(moog_target_tilt * 10))
             time.sleep(0.4)
+            moog_status = mf.get_status_jog(moog)
 
             uvimage_data = []
             cam_id = uv.parse_args()
@@ -238,6 +241,7 @@ class DataCollectorApp:
             aq.attrs['Tilt Offset'] = tilt_offset
             aq.attrs['Sun Position Azimuth'] = np.degrees(sun_pos['azimuth'])
             aq.attrs['Sun Position Altitude'] = np.degrees(sun_pos['altitude'])
+            mf.write_moog_status_attrs(aq.attrs, moog_status, moog_target_pan, moog_target_tilt)
 
             uvimg = aq.create_group('UV Image Data')
             uvimg.create_dataset('UV Raw Images', data=uvimage_data)
