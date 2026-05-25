@@ -9,7 +9,10 @@ Acknowledgement: Sierra Macleod
 
 """
 #Import Libraries
-import serial
+try:
+    import serial
+except ImportError:
+    serial = None
 import time
 import json
 from enum import IntEnum
@@ -365,6 +368,7 @@ def keep_alive(serial_port,
 
     formatted_resp = BasicResponse(rsp_data)
     #print(formatted_resp)
+    return formatted_resp
 
 def init_autobaud(serial_port):
     print('Initializing Autobaud')

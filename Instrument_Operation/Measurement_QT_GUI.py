@@ -6,7 +6,7 @@ The GUI is intentionally hardware-optional. In simulation mode it can be run
 without a Moog, Zaber stage, or UV camera attached. The same UI exposes hardware
 hooks for later field use and a small HTTP API for remote control.
 """
-
+#
 import json
 import math
 import os
