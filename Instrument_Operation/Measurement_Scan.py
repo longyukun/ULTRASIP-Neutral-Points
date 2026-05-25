@@ -150,9 +150,9 @@ pan = np.degrees(sun_pos['azimuth'])
 tilt = np.degrees(sun_pos['altitude']) 
 
 #Move Moog to Sun Position
-mf.mv_to_coord(moog,int((pan-pan_offset)*10),int((tilt-tilt_offset)*10))
-mf.get_status_jog(moog)
-time.sleep(1)
+initial_pan_command = int((pan - pan_offset) * 10)
+initial_tilt_command = int((tilt - tilt_offset) * 10)
+mf.move_to_coord_and_wait(moog, initial_pan_command, initial_tilt_command)
 
 measstart=time.time()
 
@@ -160,9 +160,6 @@ for dtilt in range(start_tilt,end_tilt,step_tilt):
     
     aq_num = aq_num + 1
 
-        
-    mf.get_status_jog(moog)
-    
     #Get sun position and set to initial pan and tilt value for moog
     dt = datetime.now()
     sun_pos = get_position(dt, longitude, latitude)
@@ -171,13 +168,13 @@ for dtilt in range(start_tilt,end_tilt,step_tilt):
     pan = np.degrees(sun_pos['azimuth']) 
     tilt = np.degrees(sun_pos['altitude']) + dtilt
     
-    moog_target_pan = pan - pan_offset
-    moog_target_tilt = tilt - tilt_offset
-    mf.mv_to_coord(moog,int(moog_target_pan*10),int(moog_target_tilt*10)) 
-    time.sleep(0.1)
-    
-    moog_status = mf.get_status_jog(moog)
-    #time.sleep(0.1)
+    moog_requested_pan = pan - pan_offset
+    moog_requested_tilt = tilt - tilt_offset
+    moog_pan_command = int(moog_requested_pan * 10)
+    moog_tilt_command = int(moog_requested_tilt * 10)
+    moog_target_pan = moog_pan_command / 10.0
+    moog_target_tilt = moog_tilt_command / 10.0
+    moog_status = mf.move_to_coord_and_wait(moog, moog_pan_command, moog_tilt_command)
     
     uvimage_data = []
     cam_id = uv.parse_args()
@@ -214,6 +211,8 @@ for dtilt in range(start_tilt,end_tilt,step_tilt):
     aq.attrs['Tilt'] = tilt
     aq.attrs['Sun Position Azimuth'] = np.degrees(sun_pos['azimuth'])
     aq.attrs['Sun Position Altitude'] = np.degrees(sun_pos['altitude'])
+    aq.attrs['Moog Requested Pan [deg]'] = moog_requested_pan
+    aq.attrs['Moog Requested Tilt [deg]'] = moog_requested_tilt
     mf.write_moog_status_attrs(aq.attrs, moog_status, moog_target_pan, moog_target_tilt)
 
 

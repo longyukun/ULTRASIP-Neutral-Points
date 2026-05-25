@@ -414,8 +414,33 @@ def mv_to_coord(serial_port,pan,tilt, get_response=True):
 
     # formatted_resp = BasicResponse(rsp_data)
     # print(formatted_resp)
-    
 
+def move_to_coord_and_wait(serial_port, pan, tilt, timeout=30.0,
+                           poll_interval=0.1, position_tolerance=0.15):
+    """Move to a commanded coordinate and return only its settled status."""
+    target_pan = float(pan) / 10.0
+    target_tilt = float(tilt) / 10.0
+    deadline = time.time() + float(timeout)
+    last_status = None
+
+    mv_to_coord(serial_port, pan, tilt)
+    while time.time() < deadline:
+        last_status = get_status_jog(serial_port)
+        target_reached = (
+            abs(last_status.pan_coord - target_pan) <= position_tolerance
+            and abs(last_status.tilt_coord - target_tilt) <= position_tolerance
+        )
+        if is_move_complete(last_status) and target_reached:
+            return last_status
+        time.sleep(poll_interval)
+
+    if last_status is None:
+        raise TimeoutError("Moog did not return a status while moving to target.")
+    raise TimeoutError(
+        "Moog failed to settle at target "
+        f"pan={target_pan:.1f}, tilt={target_tilt:.1f}; "
+        f"last actual pan={last_status.pan_coord:.1f}, tilt={last_status.tilt_coord:.1f}."
+    )
 
 def mv_to_abszero(serial_port,get_response=True):
 

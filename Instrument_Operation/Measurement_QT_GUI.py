@@ -50,6 +50,7 @@ PAN_MAX_DEG = 217.5
 TILT_MIN_DEG = -90.0
 TILT_MAX_DEG = 90.0
 MOOG_RESOLUTION_DEG = 0.01
+MOOG_COMMAND_RESOLUTION_DEG = 0.1
 UV_IMAGE_WIDTH_PX = 2848
 UV_IMAGE_HEIGHT_PX = 2848
 UV_FULL_FOV_DEG = 5.78
@@ -71,6 +72,12 @@ def clamp_pointing(pan_deg: float, tilt_deg: float) -> Tuple[float, float]:
     pan = min(max(quantize_pointing(pan_deg), PAN_MIN_DEG), PAN_MAX_DEG)
     tilt = min(max(quantize_pointing(tilt_deg), TILT_MIN_DEG), TILT_MAX_DEG)
     return pan, tilt
+
+
+def moog_command_pointing(pan_deg: float, tilt_deg: float) -> Tuple[float, float]:
+    """Return the positions represented by the integer Moog command units."""
+    pan, tilt = clamp_pointing(pan_deg, tilt_deg)
+    return int(pan * 10) / 10.0, int(tilt * 10) / 10.0
 
 
 def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) -> Tuple[float, float]:
@@ -201,7 +208,7 @@ class SimMoogController:
         return self.move_absolute(0.0, 0.0)
 
     def move_absolute(self, pan_deg: float, tilt_deg: float):
-        pan_deg, tilt_deg = clamp_pointing(pan_deg, tilt_deg)
+        pan_deg, tilt_deg = moog_command_pointing(pan_deg, tilt_deg)
         self.status.pan_deg = pan_deg
         self.status.tilt_deg = tilt_deg
         self.status.move_complete = True
@@ -260,10 +267,20 @@ class RealMoogController:
         if not self.serial_port or not self.serial_port.is_open:
             raise RuntimeError("Moog serial port is not open.")
 
-        pan_deg, tilt_deg = clamp_pointing(pan_deg, tilt_deg)
-        self.mf.mv_to_coord(self.serial_port, int(float(pan_deg) * 10), int(float(tilt_deg) * 10))
-        time.sleep(0.1)
-        return self.get_status()
+        pan_deg, tilt_deg = moog_command_pointing(pan_deg, tilt_deg)
+        raw = self.mf.move_to_coord_and_wait(
+            self.serial_port,
+            int(pan_deg * 10),
+            int(tilt_deg * 10),
+        )
+        self.status = PointingStatus(
+            pan_deg=float(raw.pan_coord),
+            tilt_deg=float(raw.tilt_coord),
+            connected=True,
+            move_complete=bool(self.mf.is_move_complete(raw)),
+            raw=raw,
+        )
+        return self.status
 
     def move_relative(self, dpan_deg: float, dtilt_deg: float):
         current = self.get_status()
@@ -566,13 +583,14 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
     keep_aspect = getattr(getattr(QtCore.Qt, "AspectRatioMode", QtCore.Qt), "KeepAspectRatio")
     smooth_transform = getattr(getattr(QtCore.Qt, "TransformationMode", QtCore.Qt), "SmoothTransformation")
     expanding_policy = getattr(getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy), "Expanding")
+    no_frame = getattr(getattr(QtWidgets.QFrame, "Shape", QtWidgets.QFrame), "NoFrame")
 
     class ToggleSwitch(QtWidgets.QCheckBox):
         def __init__(self, label=""):
             super().__init__(label)
             pointing_cursor = getattr(getattr(QtCore.Qt, "CursorShape", QtCore.Qt), "PointingHandCursor")
             self.setCursor(QtGui.QCursor(pointing_cursor))
-            self.setMinimumHeight(34)
+            self.setMinimumHeight(28)
 
         def sizeHint(self):
             metrics = self.fontMetrics()
@@ -580,23 +598,23 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 text_width = metrics.horizontalAdvance(self.text())
             else:
                 text_width = metrics.width(self.text()) if self.text() else 0
-            return QtCore.QSize(68 + text_width, 34)
+            return QtCore.QSize(56 + text_width, 28)
 
         def paintEvent(self, event):
             painter = QtGui.QPainter(self)
             antialiasing = getattr(getattr(QtGui.QPainter, "RenderHint", QtGui.QPainter), "Antialiasing")
             painter.setRenderHint(antialiasing)
-            rect = QtCore.QRectF(0, 3, 58, 28)
+            rect = QtCore.QRectF(0, 3, 46, 22)
             no_pen = getattr(getattr(QtCore.Qt, "PenStyle", QtCore.Qt), "NoPen")
             painter.setPen(no_pen)
             painter.setBrush(QtGui.QColor("#0a7cff" if self.isChecked() else "#d8d8d8"))
             painter.drawRoundedRect(rect, 14, 14)
-            knob_x = 31 if self.isChecked() else 3
+            knob_x = 25 if self.isChecked() else 3
             painter.setBrush(QtGui.QColor("#ffffff"))
-            painter.drawEllipse(QtCore.QRectF(knob_x, 5, 24, 24))
+            painter.drawEllipse(QtCore.QRectF(knob_x, 5, 18, 18))
             if self.text():
                 painter.setPen(QtGui.QColor("#222222"))
-                painter.drawText(QtCore.QRectF(68, 0, self.width() - 68, self.height()), align_center, self.text())
+                painter.drawText(QtCore.QRectF(56, 0, self.width() - 56, self.height()), align_center, self.text())
             painter.end()
 
     def make_switch(label=""):
@@ -604,7 +622,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
     def style_log_box(log):
         log.setReadOnly(True)
-        log.setMinimumHeight(150)
+        log.setMinimumHeight(100)
         log.setStyleSheet(
             "QPlainTextEdit { background: #ffffff; color: #202020; border: 1px solid #b8b8b8; }"
         )
@@ -612,8 +630,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
     class CameraView(QtWidgets.QLabel):
         def __init__(self):
             super().__init__()
-            self.setMinimumSize(640, 640)
-            self.setSizePolicy(expanding_policy, expanding_policy)
+            self.display_side = 480
+            self.setFixedSize(self.display_side, self.display_side)
             if hasattr(self, "setScaledContents"):
                 self.setScaledContents(False)
             self.setAlignment(align_center)
@@ -628,7 +646,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             return width
 
         def sizeHint(self):
-            return QtCore.QSize(720, 720)
+            return QtCore.QSize(self.display_side, self.display_side)
+
+        def set_display_side(self, side):
+            self.display_side = max(120, int(side))
+            self.setFixedSize(self.display_side, self.display_side)
+            self._rescale()
 
         def set_frame(self, frame, center=None):
             qimage = frame_to_qimage(frame, QtGui)
@@ -670,7 +693,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.sign_label = QtWidgets.QLabel("+")
             self.sign_label.setAlignment(align_center)
             self.sign_label.setStyleSheet(
-                "background: #050505; color: #39ff88; font: 700 28px 'DS-Digital', 'Courier New', monospace;"
+                "background: #050505; color: #39ff88; font: 700 23px 'DS-Digital', 'Courier New', monospace;"
             )
 
             layout = QtWidgets.QGridLayout(self)
@@ -689,15 +712,15 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             for col, step in zip(digit_columns, self.steps):
                 up = QtWidgets.QPushButton("▲")
                 down = QtWidgets.QPushButton("▼")
-                up.setFixedHeight(22)
-                down.setFixedHeight(22)
+                up.setFixedHeight(18)
+                down.setFixedHeight(18)
                 up.clicked.connect(lambda checked=False, s=step: self.move_callback(s))
                 down.clicked.connect(lambda checked=False, s=step: self.move_callback(-s))
                 digit = QtWidgets.QLabel("0")
                 digit.setAlignment(align_center)
-                digit.setMinimumWidth(28)
+                digit.setMinimumWidth(23)
                 digit.setStyleSheet(
-                    "background: #050505; color: #39ff88; font: 700 30px 'DS-Digital', 'Courier New', monospace;"
+                    "background: #050505; color: #39ff88; font: 700 24px 'DS-Digital', 'Courier New', monospace;"
                 )
                 self.digit_labels.append(digit)
                 layout.addWidget(up, 1, col)
@@ -707,7 +730,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             dot = QtWidgets.QLabel(".")
             dot.setAlignment(align_center)
             dot.setStyleSheet(
-                "background: #050505; color: #39ff88; font: 700 30px 'DS-Digital', 'Courier New', monospace;"
+                "background: #050505; color: #39ff88; font: 700 24px 'DS-Digital', 'Courier New', monospace;"
             )
             layout.addWidget(dot, 2, 4)
 
@@ -722,7 +745,14 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def __init__(self):
             super().__init__()
             self.setWindowTitle("ULTRASIP Auto Measurement")
-            self.resize(1180, 760)
+            self.resize(1000, 680)
+            self.setStyleSheet(
+                "QWidget { font-size: 11px; }"
+                "QGroupBox { font-weight: 600; margin-top: 7px; }"
+                "QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px; }"
+                "QPushButton { min-height: 22px; padding: 2px 7px; }"
+                "QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 20px; }"
+            )
 
             self.simulation = True
             self.moog = SimMoogController()
@@ -770,11 +800,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             auto_page = QtWidgets.QWidget()
             auto_layout = QtWidgets.QVBoxLayout(auto_page)
-            auto_layout.setContentsMargins(18, 18, 18, 18)
-            auto_layout.setSpacing(12)
+            auto_layout.setContentsMargins(9, 9, 9, 9)
+            auto_layout.setSpacing(6)
 
             title = QtWidgets.QLabel("ULTRASIP Auto Measurement")
-            title.setStyleSheet("font: 700 24px sans-serif;")
+            title.setStyleSheet("font: 700 18px sans-serif;")
             auto_layout.addWidget(title)
 
             calibration_group = QtWidgets.QGroupBox("Calibration")
@@ -786,7 +816,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.auto_tilt_offset_label = QtWidgets.QLabel("")
             self.auto_centered_pan_label = QtWidgets.QLabel("")
             self.calibration_btn = QtWidgets.QPushButton("Calibration")
-            self.calibration_btn.setMinimumHeight(40)
+            self.calibration_btn.setMinimumHeight(28)
             self.calibration_btn.clicked.connect(self.show_calibration_page)
             calibration_layout.addWidget(QtWidgets.QLabel("Status"), 0, 0)
             calibration_layout.addWidget(self.calibration_status_label, 0, 1)
@@ -946,19 +976,32 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_layout.addWidget(self.auto_log)
             auto_layout.addStretch(1)
 
+            auto_scroll = QtWidgets.QScrollArea()
+            auto_scroll.setWidgetResizable(True)
+            auto_scroll.setFrameShape(no_frame)
+            auto_scroll.setWidget(auto_page)
+
             central = QtWidgets.QWidget()
             root = QtWidgets.QHBoxLayout(central)
-            root.setContentsMargins(12, 12, 12, 12)
-            root.setSpacing(12)
+            root.setContentsMargins(6, 6, 6, 6)
+            root.setSpacing(6)
 
             controls = QtWidgets.QWidget()
-            controls.setMaximumWidth(390)
+            controls.setMinimumWidth(300)
+            controls.setMaximumWidth(330)
             controls_layout = QtWidgets.QVBoxLayout(controls)
-            controls_layout.setSpacing(10)
-            root.addWidget(controls)
+            controls_layout.setContentsMargins(5, 5, 5, 5)
+            controls_layout.setSpacing(5)
+            controls_scroll = QtWidgets.QScrollArea()
+            controls_scroll.setWidgetResizable(True)
+            controls_scroll.setFrameShape(no_frame)
+            controls_scroll.setMinimumWidth(315)
+            controls_scroll.setMaximumWidth(350)
+            controls_scroll.setWidget(controls)
+            root.addWidget(controls_scroll)
 
             self.done_calibration_btn = QtWidgets.QPushButton("Done Calibration - Back to Auto")
-            self.done_calibration_btn.setMinimumHeight(38)
+            self.done_calibration_btn.setMinimumHeight(28)
             self.done_calibration_btn.clicked.connect(self.finish_calibration)
             controls_layout.addWidget(self.done_calibration_btn)
 
@@ -991,7 +1034,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             connection_layout.addWidget(self.pol_switch, 3, 2)
 
             self.stop_btn = QtWidgets.QPushButton("STOP - close all")
-            self.stop_btn.setMinimumHeight(42)
+            self.stop_btn.setMinimumHeight(30)
             self.stop_btn.setStyleSheet("background: #b00020; color: white; font-weight: 700;")
             self.stop_btn.clicked.connect(self.stop_all)
             connection_layout.addWidget(self.stop_btn, 4, 0, 1, 3)
@@ -1089,13 +1132,50 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             style_log_box(self.log)
             controls_layout.addWidget(self.log)
 
-            self.camera_view = CameraView()
-            root.addWidget(self.camera_view, 1)
+            preview_panel = QtWidgets.QWidget()
+            preview_layout = QtWidgets.QVBoxLayout(preview_panel)
+            preview_layout.setContentsMargins(0, 0, 0, 0)
+            preview_layout.setSpacing(5)
+            zoom_layout = QtWidgets.QHBoxLayout()
+            self.fit_preview_btn = QtWidgets.QPushButton("Fit")
+            self.fit_preview_btn.clicked.connect(self.fit_camera_preview)
+            self.zoom_out_btn = QtWidgets.QPushButton("-")
+            self.zoom_out_btn.setFixedWidth(32)
+            self.zoom_out_btn.clicked.connect(lambda: self.adjust_camera_zoom(-10))
+            self.zoom_in_btn = QtWidgets.QPushButton("+")
+            self.zoom_in_btn.setFixedWidth(32)
+            self.zoom_in_btn.clicked.connect(lambda: self.adjust_camera_zoom(10))
+            self.zoom_slider = QtWidgets.QSlider(
+                getattr(getattr(QtCore.Qt, "Orientation", QtCore.Qt), "Horizontal")
+            )
+            self.zoom_slider.setRange(25, 250)
+            self.zoom_slider.setValue(100)
+            self.zoom_slider.valueChanged.connect(self.set_camera_zoom)
+            self.zoom_label = QtWidgets.QLabel("Fit")
+            self.zoom_label.setMinimumWidth(46)
+            zoom_layout.addWidget(QtWidgets.QLabel("Preview"))
+            zoom_layout.addStretch(1)
+            zoom_layout.addWidget(self.fit_preview_btn)
+            zoom_layout.addWidget(self.zoom_out_btn)
+            zoom_layout.addWidget(self.zoom_slider)
+            zoom_layout.addWidget(self.zoom_in_btn)
+            zoom_layout.addWidget(self.zoom_label)
+            preview_layout.addLayout(zoom_layout)
 
-            self.pages.addWidget(auto_page)
+            self.camera_view = CameraView()
+            self.camera_scroll = QtWidgets.QScrollArea()
+            self.camera_scroll.setWidgetResizable(False)
+            self.camera_scroll.setAlignment(align_center)
+            self.camera_scroll.setWidget(self.camera_view)
+            preview_layout.addWidget(self.camera_scroll, 1)
+            root.addWidget(preview_panel, 1)
+
+            self.pages.addWidget(auto_scroll)
             self.pages.addWidget(central)
-            self.pages.setCurrentWidget(auto_page)
+            self.pages.setCurrentWidget(auto_scroll)
             self.update_auto_calibration_labels()
+            self.preview_fit = True
+            QtCore.QTimer.singleShot(0, self.fit_camera_preview)
 
         def log_msg(self, text):
             self.last_message = f"{time.strftime('%H:%M:%S')}  {text}"
@@ -1104,8 +1184,34 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 if log is not None:
                     log.appendPlainText(self.last_message)
 
+        def fit_camera_preview(self):
+            self.preview_fit = True
+            self.zoom_slider.blockSignals(True)
+            self.zoom_slider.setValue(100)
+            self.zoom_slider.blockSignals(False)
+            self.zoom_label.setText("Fit")
+            viewport = self.camera_scroll.viewport().size()
+            side = max(160, min(viewport.width() - 4, viewport.height() - 4))
+            self.camera_view.set_display_side(side)
+
+        def set_camera_zoom(self, value):
+            self.preview_fit = False
+            side = max(160, int(560 * float(value) / 100.0))
+            self.camera_view.set_display_side(side)
+            self.zoom_label.setText(f"{value}%")
+
+        def adjust_camera_zoom(self, delta):
+            self.zoom_slider.setValue(self.zoom_slider.value() + delta)
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            if getattr(self, "preview_fit", False):
+                QtCore.QTimer.singleShot(0, self.fit_camera_preview)
+
         def show_calibration_page(self):
             self.pages.setCurrentIndex(1)
+            if self.preview_fit:
+                QtCore.QTimer.singleShot(0, self.fit_camera_preview)
             self.log_msg("Calibration page opened")
 
         def finish_calibration(self):
@@ -1301,6 +1407,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["UV Image Width [px]"] = UV_IMAGE_WIDTH_PX
                 meas.attrs["UV Image Height [px]"] = UV_IMAGE_HEIGHT_PX
                 meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
+                meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
 
                 for aq_num, dtilt in enumerate(dtilts):
                     if self.stop_acquisition_event.is_set():
@@ -1311,8 +1418,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     sun_azimuth, sun_altitude = solar_position_deg(dt, config["latitude"], config["longitude"])
                     pan = sun_azimuth
                     tilt = sun_altitude + float(dtilt)
-                    target_pan = pan - config["pan_offset"]
-                    target_tilt = tilt - config["tilt_offset"]
+                    requested_pan = pan - config["pan_offset"]
+                    requested_tilt = tilt - config["tilt_offset"]
+                    target_pan, target_tilt = moog_command_pointing(requested_pan, requested_tilt)
 
                     with self.motion_lock:
                         moog_status = self.moog.move_absolute(target_pan, target_tilt)
@@ -1346,6 +1454,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     aq.attrs["Delta Tilt From Sun [deg]"] = float(dtilt)
                     aq.attrs["Sun Position Azimuth"] = sun_azimuth
                     aq.attrs["Sun Position Altitude"] = sun_altitude
+                    aq.attrs["Moog Requested Pan [deg]"] = requested_pan
+                    aq.attrs["Moog Requested Tilt [deg]"] = requested_tilt
                     write_pointing_attrs(aq.attrs, moog_status, target_pan, target_tilt)
 
                     uvimg = aq.create_group("UV Image Data")
@@ -1909,6 +2019,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     meta.attrs["Moog Pan Range [deg]"] = np.array([PAN_MIN_DEG, PAN_MAX_DEG])
                     meta.attrs["Moog Tilt Range [deg]"] = np.array([TILT_MIN_DEG, TILT_MAX_DEG])
                     meta.attrs["Moog Resolution [deg]"] = MOOG_RESOLUTION_DEG
+                    meta.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
 
                     cal = h5.create_group("Pointing_Calibration")
                     cal.attrs["Pan [deg]"] = float(status.pan_deg)
