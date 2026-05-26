@@ -51,6 +51,8 @@ TILT_MIN_DEG = -90.0
 TILT_MAX_DEG = 90.0
 MOOG_RESOLUTION_DEG = 0.01
 MOOG_COMMAND_RESOLUTION_DEG = 0.1
+CENTERING_PAN_PROBE_DEG = MOOG_COMMAND_RESOLUTION_DEG
+CENTERING_MIN_PROBE_SHIFT_PX = 2.0
 UV_IMAGE_WIDTH_PX = 2848
 UV_IMAGE_HEIGHT_PX = 2848
 UV_FULL_FOV_DEG = 5.78
@@ -89,8 +91,10 @@ def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) 
 
     # NOAA-style approximation. Good enough for GUI trigger monitoring; use
     # suncalc when installed for consistency with the original acquisition code.
-    day = dt.timetuple().tm_yday
-    hour = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+    local_dt = dt.astimezone()
+    day = local_dt.timetuple().tm_yday
+    hour = local_dt.hour + local_dt.minute / 60.0 + local_dt.second / 3600.0
+    utc_offset_minutes = local_dt.utcoffset().total_seconds() / 60.0
     gamma = 2.0 * math.pi / 365.0 * (day - 1 + (hour - 12.0) / 24.0)
     eq_time = 229.18 * (
         0.000075
@@ -108,7 +112,7 @@ def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) 
         - 0.002697 * math.cos(3 * gamma)
         + 0.00148 * math.sin(3 * gamma)
     )
-    time_offset = eq_time + 4.0 * longitude_deg
+    time_offset = eq_time + 4.0 * longitude_deg - utc_offset_minutes
     true_solar_time = (hour * 60.0 + time_offset) % 1440.0
     hour_angle = math.radians(true_solar_time / 4.0 - 180.0)
     lat = math.radians(latitude_deg)
@@ -1375,6 +1379,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 status += f", next target={nearest:.2f} deg, error={altitude - nearest:+.2f} deg"
             else:
                 status += ", all targets completed"
+            if self.auto_job_running:
+                status += ", acquisition running"
             self.sun_status_label.setText(status)
 
             if nearest is None or self.auto_job_running:
@@ -1669,7 +1675,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             f"Moog pan={result['centered_pan_deg']:.2f}, "
                             f"pan_offset={result['pan_offset_deg']:.2f}, "
                             f"tilt={result['centered_tilt_deg']:.2f}, "
-                            f"correction dpan={result['applied_dpan_deg']:.4f}, dtilt={result['applied_dtilt_deg']:.4f}"
+                            f"correction dpan={result['applied_dpan_deg']:.4f}, dtilt={result['applied_dtilt_deg']:.4f}, "
+                            f"pan response={result['pan_pixels_per_degree']:+.2f} px/deg"
                         )
                     else:
                         self.log_msg(self.center_failure_message(result.get("info", {})))
@@ -1893,6 +1900,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def stop_all(self):
             self.stop_acquisition_event.set()
             self.stop_acquisition_btn.setEnabled(False)
+            if self.auto_monitoring:
+                self.stop_sun_monitor()
             self.timer.stop()
             self.set_moog_home_enabled(False)
             self.set_switch_pair("camera_switch", False)
@@ -2096,10 +2105,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "no bright component": "Sun centering failed: no sun-like bright region detected in the frame",
                 "component too small": "Sun centering failed: detected bright region is too small to identify as the sun",
                 "no bright pixels": "Sun centering failed: no bright solar pixels detected in the frame",
+                "pan probe failed": "Sun centering failed: automatic pan direction detection did not produce a usable image shift",
             }
             message = messages.get(reason, f"Sun centering failed: {reason}")
             if "area" in info:
                 message += f" (area={info['area']} px)"
+            if "detail" in info:
+                message += f" ({info['detail']})"
             return message
 
         def remote_status(self):
@@ -2150,7 +2162,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             return self.remote_status()
 
         def remote_center(self):
-            frame = self.last_frame
             deg_per_pixel = self.deg_per_pixel.value()
             latitude = self.latitude_input.value()
             longitude = self.longitude_input.value()
@@ -2159,12 +2170,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 if not bool(getattr(self.camera, "connected", False)):
                     return {"ok": False, "info": {"reason": "camera not open"}}
 
-                local_frame = frame
                 with self.motion_lock:
                     status = self.moog.get_status()
-                if local_frame is None:
-                    with self.camera_lock:
-                        local_frame = self.camera.get_frame(status.pan_deg, status.tilt_deg)
+                    initial_pan_deg = float(status.pan_deg)
+                    initial_tilt_deg = float(status.tilt_deg)
+                with self.camera_lock:
+                    local_frame = self.camera.get_frame(initial_pan_deg, initial_tilt_deg)
 
                 center, info = detect_sun_center(local_frame)
                 if center is None:
@@ -2174,11 +2185,56 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 cx, cy = center
                 dx = cx - width / 2.0
                 dy = cy - height / 2.0
-                dpan = -dx * deg_per_pixel
                 dtilt = -dy * deg_per_pixel
+                pan_probe_deg = CENTERING_PAN_PROBE_DEG
+                if initial_pan_deg + pan_probe_deg > PAN_MAX_DEG:
+                    pan_probe_deg = -CENTERING_PAN_PROBE_DEG
 
                 with self.motion_lock:
-                    centered_status = self.moog.move_relative(dpan, dtilt)
+                    probe_status = self.moog.move_absolute(
+                        initial_pan_deg + pan_probe_deg,
+                        initial_tilt_deg,
+                    )
+                    self.current_status = probe_status
+                    applied_probe_deg = float(probe_status.pan_deg) - initial_pan_deg
+                if abs(applied_probe_deg) < MOOG_COMMAND_RESOLUTION_DEG / 2.0:
+                    with self.motion_lock:
+                        self.current_status = self.moog.move_absolute(initial_pan_deg, initial_tilt_deg)
+                    return {
+                        "ok": False,
+                        "info": {"reason": "pan probe failed", "detail": "pan probe movement was clamped"},
+                    }
+
+                probe_center = None
+                probe_info = {}
+                try:
+                    with self.camera_lock:
+                        probe_frame = self.camera.get_frame(probe_status.pan_deg, probe_status.tilt_deg)
+                    probe_center, probe_info = detect_sun_center(probe_frame)
+                finally:
+                    with self.motion_lock:
+                        restored_status = self.moog.move_absolute(initial_pan_deg, initial_tilt_deg)
+                        self.current_status = restored_status
+                if probe_center is None:
+                    return {"ok": False, "info": {"reason": "pan probe failed", "detail": str(probe_info)}}
+
+                pan_probe_shift_px = probe_center[0] - cx
+                if abs(pan_probe_shift_px) < CENTERING_MIN_PROBE_SHIFT_PX:
+                    return {
+                        "ok": False,
+                        "info": {
+                            "reason": "pan probe failed",
+                            "detail": f"image shift={pan_probe_shift_px:.2f} px",
+                        },
+                    }
+                pan_pixels_per_degree = pan_probe_shift_px / applied_probe_deg
+                dpan = -dx / pan_pixels_per_degree
+
+                with self.motion_lock:
+                    centered_status = self.moog.move_absolute(
+                        restored_status.pan_deg + dpan,
+                        restored_status.tilt_deg + dtilt,
+                    )
                     self.current_status = centered_status
                 centered_dt = datetime.now()
                 sun_pan, sun_tilt = solar_position_deg(centered_dt, latitude, longitude)
@@ -2195,6 +2251,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     "pixel_error_y": dy,
                     "applied_dpan_deg": dpan,
                     "applied_dtilt_deg": dtilt,
+                    "pan_probe_deg": applied_probe_deg,
+                    "pan_probe_shift_px": pan_probe_shift_px,
+                    "pan_pixels_per_degree": pan_pixels_per_degree,
                     "centered_pan_deg": centered_status.pan_deg,
                     "centered_tilt_deg": centered_status.tilt_deg,
                     "sun_pan_deg": sun_pan,
