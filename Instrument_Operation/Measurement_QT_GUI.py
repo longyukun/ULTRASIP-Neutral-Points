@@ -771,7 +771,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.last_center_result = None
             self.last_message = ""
             self.current_output_text = ""
-            self.pan_offset = -9.0
+            self.pan_offset = 0.0
             self.tilt_offset = 0.0
             self.calibration_complete = False
             self.completed_sun_targets = set()
@@ -1134,11 +1134,15 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.deg_per_pixel.setDecimals(6)
             self.deg_per_pixel.setValue(UV_DEG_PER_PIXEL)
             self.deg_per_pixel.setSingleStep(0.0001)
+            self.aim_sun_btn = QtWidgets.QPushButton("Aim at calculated sun")
+            self.aim_sun_btn.setEnabled(False)
+            self.aim_sun_btn.clicked.connect(self.aim_at_calculated_sun)
             self.center_btn = QtWidgets.QPushButton("Center sun in FOV")
             self.center_btn.clicked.connect(self.center_sun)
             center_layout.addWidget(QtWidgets.QLabel("Deg per pixel"), 0, 0)
             center_layout.addWidget(self.deg_per_pixel, 0, 1)
-            center_layout.addWidget(self.center_btn, 1, 0, 1, 2)
+            center_layout.addWidget(self.aim_sun_btn, 1, 0, 1, 2)
+            center_layout.addWidget(self.center_btn, 2, 0, 1, 2)
 
             remote_group = QtWidgets.QGroupBox("Remote control")
             remote_layout = QtWidgets.QGridLayout(remote_group)
@@ -1247,16 +1251,24 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def finish_calibration(self):
             if self.last_center_result and self.last_center_result.get("ok"):
                 centered_pan = float(self.last_center_result["centered_pan_deg"])
+                sun_pan = float(self.last_center_result["sun_pan_deg"])
             else:
                 centered_pan = float(self.current_status.pan_deg)
+                sun_pan, _ = solar_position_deg(
+                    datetime.now(),
+                    self.latitude_input.value(),
+                    self.longitude_input.value(),
+                )
 
-            self.pan_offset = quantize_pointing(centered_pan)
+            self.pan_offset = quantize_pointing(sun_pan - centered_pan)
             self.tilt_offset = 0.0
             self.calibration_complete = True
             self.update_auto_calibration_labels()
             self.pages.setCurrentIndex(0)
             self.log_msg(
-                f"Calibration complete: pan_offset={self.pan_offset:.2f}, tilt_offset={self.tilt_offset:.2f}"
+                "Calibration complete: "
+                f"sun pan={sun_pan:.2f}, centered Moog pan={centered_pan:.2f}, "
+                f"pan_offset={self.pan_offset:.2f}, tilt_offset={self.tilt_offset:.2f}"
             )
 
         def update_auto_calibration_labels(self):
@@ -1651,10 +1663,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.update_auto_calibration_labels()
                     if result.get("ok"):
                         self.apply_status()
-                        self.log_msg(self.current_output_text)
                         self.log_msg(
                             "Centered sun: "
-                            f"pan={result['centered_pan_deg']:.2f}, tilt={result['centered_tilt_deg']:.2f}, "
+                            f"sun pan={result['sun_pan_deg']:.2f}, "
+                            f"Moog pan={result['centered_pan_deg']:.2f}, "
+                            f"pan_offset={result['pan_offset_deg']:.2f}, "
+                            f"tilt={result['centered_tilt_deg']:.2f}, "
                             f"correction dpan={result['applied_dpan_deg']:.4f}, dtilt={result['applied_dtilt_deg']:.4f}"
                         )
                     else:
@@ -1747,6 +1761,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "auto_home_btn",
                 "refresh_position_btn",
                 "auto_refresh_position_btn",
+                "aim_sun_btn",
             ):
                 button = getattr(self, button_name, None)
                 if button is not None:
@@ -1991,6 +2006,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             )
 
         def jog(self, dpan, dtilt):
+            self.clear_center_result_for_reposition()
+
             def task():
                 with self.motion_lock:
                     status = self.moog.move_relative(dpan, dtilt)
@@ -2003,6 +2020,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.goto_inputs_dirty = True
 
         def goto_inputs(self):
+            self.clear_center_result_for_reposition()
             pan = self.pan_input.value()
             tilt = self.tilt_input.value()
 
@@ -2013,6 +2031,48 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 return f"Moved to pan={pan:.2f}, tilt={tilt:.2f}", status
 
             self.submit_worker("goto", task)
+
+        def clear_center_result_for_reposition(self):
+            if self.last_center_result and self.last_center_result.get("ok"):
+                self.last_center_result = None
+                self.update_auto_calibration_labels()
+                self.log_msg("Previous sun-center result cleared after pointing change")
+
+        def aim_at_calculated_sun(self):
+            if not self.current_status.connected:
+                self.log_msg("Cannot aim at calculated sun: Moog is not open")
+                return
+
+            self.clear_center_result_for_reposition()
+            dt = datetime.now()
+            sun_pan, sun_tilt = solar_position_deg(
+                dt,
+                self.latitude_input.value(),
+                self.longitude_input.value(),
+            )
+            target_pan, target_tilt = moog_command_pointing(
+                sun_pan - self.pan_offset,
+                sun_tilt - self.tilt_offset,
+            )
+            self.log_msg(
+                "Aiming at calculated sun: "
+                f"sun pan={sun_pan:.2f}, sun tilt={sun_tilt:.2f}, "
+                f"using pan_offset={self.pan_offset:.2f}, "
+                f"target Moog pan={target_pan:.2f}, tilt={target_tilt:.2f}"
+            )
+
+            def task():
+                with self.motion_lock:
+                    status = self.moog.move_absolute(target_pan, target_tilt)
+                    self.current_status = status
+                return (
+                    "Calculated sun aim complete: "
+                    f"actual Moog pan={status.pan_deg:.2f}, tilt={status.tilt_deg:.2f}; "
+                    "adjust manually or use Center sun in FOV",
+                    status,
+                )
+
+            self.submit_worker("motion", task)
 
         def set_polarizer(self, angle):
             def task():
@@ -2092,6 +2152,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def remote_center(self):
             frame = self.last_frame
             deg_per_pixel = self.deg_per_pixel.value()
+            latitude = self.latitude_input.value()
+            longitude = self.longitude_input.value()
 
             def task():
                 if not bool(getattr(self.camera, "connected", False)):
@@ -2118,6 +2180,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 with self.motion_lock:
                     centered_status = self.moog.move_relative(dpan, dtilt)
                     self.current_status = centered_status
+                centered_dt = datetime.now()
+                sun_pan, sun_tilt = solar_position_deg(centered_dt, latitude, longitude)
+                pan_offset = quantize_pointing(sun_pan - centered_status.pan_deg)
                 with self.camera_lock:
                     centered_frame = self.camera.get_frame(centered_status.pan_deg, centered_status.tilt_deg)
                 centered_center, _ = detect_sun_center(centered_frame)
@@ -2132,6 +2197,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     "applied_dtilt_deg": dtilt,
                     "centered_pan_deg": centered_status.pan_deg,
                     "centered_tilt_deg": centered_status.tilt_deg,
+                    "sun_pan_deg": sun_pan,
+                    "sun_tilt_deg": sun_tilt,
+                    "pan_offset_deg": pan_offset,
+                    "centered_local_time": centered_dt.isoformat(timespec="seconds"),
                     "info": info,
                 }
 
@@ -2177,6 +2246,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     if self.last_center_result and self.last_center_result.get("ok"):
                         cal.attrs["Sun Centered Pan [deg]"] = float(self.last_center_result["centered_pan_deg"])
                         cal.attrs["Sun Centered Tilt [deg]"] = float(self.last_center_result["centered_tilt_deg"])
+                        cal.attrs["Calculated Sun Pan [deg]"] = float(self.last_center_result["sun_pan_deg"])
+                        cal.attrs["Calculated Sun Tilt [deg]"] = float(self.last_center_result["sun_tilt_deg"])
+                        cal.attrs["Pan Offset [deg]"] = float(self.last_center_result["pan_offset_deg"])
                     cal.attrs["Polarizer Angle [deg]"] = float(getattr(self.polarizer, "angle_deg", 0.0))
                     cal.attrs["Camera Exposure [us]"] = float(self.camera.get_exposure())
                     cal.attrs["Auto Exposure Enabled"] = int(self.auto_exposure_check.isChecked())
