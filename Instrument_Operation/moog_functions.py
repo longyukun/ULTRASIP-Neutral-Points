@@ -251,14 +251,20 @@ def build_req(cmd, data: list) -> list:
     return buffer_out
 
 def rcv_response(serial_port) -> list:
+    def read_byte():
+        value = serial_port.read()
+        if not value:
+            raise TimeoutError("Timed out waiting for Moog response.")
+        return value[0]
+
     char_in = 0
     while char_in not in [CTRL_ACK, CTRL_NACK]:
-        char_in = list(serial_port.read())[0]  # read one char, conv bytes to list, pull 1st
+        char_in = read_byte()
 
     buffer = [char_in]  # Add start char as first char in buffer
 
     while char_in != CTRL_ETX:
-        char_in = list(serial_port.read())[0]  # read one char
+        char_in = read_byte()
         buffer.append(char_in)  # add to list
 
     return buffer
@@ -288,7 +294,8 @@ def get_status_jog(serial_port,
                    pan_speed=0, pan_dir=0,
                    tilt_speed=0, tilt_dir=0,
                    zoom_speed=0, zoom_dir=0,
-                   focus_speed=0, focus_dir=0):
+                   focus_speed=0, focus_dir=0,
+                   verbose=True):
     jog_cmd_byte = (ru << 3) | (osl << 2) | (stop << 1) | res
     pan = (pan_speed << 1) | pan_dir
     tilt = (tilt_speed << 1) | tilt_dir
@@ -302,7 +309,8 @@ def get_status_jog(serial_port,
         return
 
     response = remove_escapes(response_raw)
-    print([x for x in response_raw]) 
+    if verbose:
+        print([x for x in response_raw])
 
     return_code = response.pop(0)  # Pop ACK/NACK off front
     response.pop()  # Pop ETX from back
@@ -314,16 +322,18 @@ def get_status_jog(serial_port,
     # Check LRC is valid
     lrc_matches = calc_checksum(rsp_cmd, rsp_data) == rsp_lrc
     
-    print(('RCV | GET STATUS/JOG | '
-            'ACK: {ack_rsp}, ID: {id}, CMD: {cmd}, '
-            'LRC match: {lrc_match}, Data: {data}').format(ack_rsp='YES' if return_code == CTRL_ACK else 'NO',
-                                                          id=hex(rsp_identity),
-                                                          cmd=hex(rsp_cmd),
-                                                          lrc_match='YES' if lrc_matches else 'NO',
-                                                          data=[hex(x) for x in rsp_data]))
+    if verbose:
+        print(('RCV | GET STATUS/JOG | '
+                'ACK: {ack_rsp}, ID: {id}, CMD: {cmd}, '
+                'LRC match: {lrc_match}, Data: {data}').format(ack_rsp='YES' if return_code == CTRL_ACK else 'NO',
+                                                              id=hex(rsp_identity),
+                                                              cmd=hex(rsp_cmd),
+                                                              lrc_match='YES' if lrc_matches else 'NO',
+                                                              data=[hex(x) for x in rsp_data]))
 
     formatted_resp = BasicResponse(rsp_data, raw_bytes=response_raw, unescaped_bytes=response)
-    print(formatted_resp)
+    if verbose:
+        print(formatted_resp)
     return formatted_resp
     
 def keep_alive(serial_port,
@@ -416,7 +426,8 @@ def mv_to_coord(serial_port,pan,tilt, get_response=True):
     # print(formatted_resp)
 
 def move_to_coord_and_wait(serial_port, pan, tilt, timeout=30.0,
-                           poll_interval=0.1, position_tolerance=0.15):
+                           poll_interval=0.1, position_tolerance=0.15,
+                           verbose=True):
     """Move to a commanded coordinate and return only its settled status."""
     target_pan = float(pan) / 10.0
     target_tilt = float(tilt) / 10.0
@@ -425,7 +436,7 @@ def move_to_coord_and_wait(serial_port, pan, tilt, timeout=30.0,
 
     mv_to_coord(serial_port, pan, tilt)
     while time.time() < deadline:
-        last_status = get_status_jog(serial_port)
+        last_status = get_status_jog(serial_port, verbose=verbose)
         target_reached = (
             abs(last_status.pan_coord - target_pan) <= position_tolerance
             and abs(last_status.tilt_coord - target_tilt) <= position_tolerance

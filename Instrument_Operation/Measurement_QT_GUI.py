@@ -207,6 +207,8 @@ class SimMoogController:
         self.status.connected = False
 
     def home(self):
+        current_tilt = self.status.tilt_deg
+        self.move_absolute(0.0, current_tilt)
         return self.move_absolute(0.0, 0.0)
 
     def move_absolute(self, pan_deg: float, tilt_deg: float):
@@ -242,6 +244,8 @@ class RealMoogController:
             self.serial_port = serial.Serial()
             self.serial_port.baudrate = 9600
             self.serial_port.port = port
+            self.serial_port.timeout = 1.0
+            self.serial_port.write_timeout = 1.0
             self.serial_port.open()
             self.mf.init_autobaud(self.serial_port)
             return self.get_status()
@@ -261,18 +265,9 @@ class RealMoogController:
         if not self.serial_port or not self.serial_port.is_open:
             return self.status
 
-        self.mf.mv_to_home(self.serial_port, 0, 0)
-        deadline = time.time() + 30.0
-        while time.time() < deadline:
-            status = self.get_status()
-            at_home = abs(status.pan_deg) <= 0.15 and abs(status.tilt_deg) <= 0.15
-            if status.move_complete and at_home:
-                return status
-            time.sleep(0.1)
-        raise TimeoutError(
-            "Moog failed to settle at home; "
-            f"last actual pan={self.status.pan_deg:.1f}, tilt={self.status.tilt_deg:.1f}."
-        )
+        current = self.get_status()
+        self.move_absolute(0.0, current.tilt_deg)
+        return self.move_absolute(0.0, 0.0)
 
     def move_absolute(self, pan_deg: float, tilt_deg: float):
         if not self.serial_port or not self.serial_port.is_open:
@@ -283,6 +278,7 @@ class RealMoogController:
             self.serial_port,
             int(pan_deg * 10),
             int(tilt_deg * 10),
+            verbose=False,
         )
         self.status = PointingStatus(
             pan_deg=float(raw.pan_coord),
@@ -302,7 +298,7 @@ class RealMoogController:
             self.status.connected = False
             return self.status
 
-        raw = self.mf.get_status_jog(self.serial_port)
+        raw = self.mf.get_status_jog(self.serial_port, verbose=False)
         self.status = PointingStatus(
             pan_deg=float(raw.pan_coord),
             tilt_deg=float(raw.tilt_coord),
@@ -789,6 +785,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.result_queue = queue.Queue()
             self.camera_pending = False
             self.status_pending = False
+            self.goto_inputs_dirty = False
             self.current_status = self.moog.get_status()
 
             self.timer = QtCore.QTimer(self)
@@ -799,10 +796,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.result_timer.setInterval(50)
             self.result_timer.timeout.connect(self.process_worker_results)
             self.result_timer.start()
-
-            self.moog_status_timer = QtCore.QTimer(self)
-            self.moog_status_timer.setInterval(200)
-            self.moog_status_timer.timeout.connect(self.request_moog_status)
 
             self.auto_monitor_timer = QtCore.QTimer(self)
             self.auto_monitor_timer.timeout.connect(self.check_sun_trigger)
@@ -860,12 +853,15 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.auto_pol_switch = make_switch("Polarizer")
             self.auto_home_btn = QtWidgets.QPushButton("Home / Reset")
             self.auto_home_btn.setEnabled(False)
+            self.auto_refresh_position_btn = QtWidgets.QPushButton("Refresh Position")
+            self.auto_refresh_position_btn.setEnabled(False)
             self.auto_stop_btn = QtWidgets.QPushButton("STOP - close all")
             self.auto_stop_btn.setStyleSheet("background: #b00020; color: white; font-weight: 700;")
             self.auto_moog_switch.toggled.connect(self.toggle_moog)
             self.auto_camera_switch.toggled.connect(self.toggle_camera)
             self.auto_pol_switch.toggled.connect(self.toggle_polarizer)
             self.auto_home_btn.clicked.connect(self.home_moog)
+            self.auto_refresh_position_btn.clicked.connect(self.request_moog_status)
             self.auto_stop_btn.clicked.connect(self.stop_all)
             auto_connection_layout.addWidget(self.auto_sim_check, 0, 0)
             auto_connection_layout.addWidget(self.auto_refresh_btn, 0, 1)
@@ -878,7 +874,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_connection_layout.addWidget(self.auto_pol_port, 3, 1)
             auto_connection_layout.addWidget(self.auto_pol_switch, 3, 2)
             auto_connection_layout.addWidget(self.auto_home_btn, 4, 0)
-            auto_connection_layout.addWidget(self.auto_stop_btn, 4, 1, 1, 2)
+            auto_connection_layout.addWidget(self.auto_refresh_position_btn, 4, 1)
+            auto_connection_layout.addWidget(self.auto_stop_btn, 4, 2)
 
             scan_group = QtWidgets.QGroupBox("Auto Scan")
             scan_layout = QtWidgets.QGridLayout(scan_group)
@@ -1061,8 +1058,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.home_btn = QtWidgets.QPushButton("Home / Reset")
             self.home_btn.setEnabled(False)
             self.home_btn.clicked.connect(self.home_moog)
+            self.refresh_position_btn = QtWidgets.QPushButton("Refresh Position")
+            self.refresh_position_btn.setEnabled(False)
+            self.refresh_position_btn.clicked.connect(self.request_moog_status)
             connection_layout.addWidget(self.home_btn, 4, 0)
-            connection_layout.addWidget(self.stop_btn, 4, 1, 1, 2)
+            connection_layout.addWidget(self.refresh_position_btn, 4, 1)
+            connection_layout.addWidget(self.stop_btn, 4, 2)
 
             status_group = QtWidgets.QGroupBox("Pointing")
             status_layout = QtWidgets.QVBoxLayout(status_group)
@@ -1077,10 +1078,14 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.pan_input.setRange(PAN_MIN_DEG, PAN_MAX_DEG)
             self.pan_input.setDecimals(2)
             self.pan_input.setSingleStep(MOOG_RESOLUTION_DEG)
+            self.pan_input.valueChanged.connect(self.mark_goto_inputs_dirty)
+            self.pan_input.lineEdit().textEdited.connect(self.mark_goto_inputs_dirty)
             self.tilt_input = QtWidgets.QDoubleSpinBox()
             self.tilt_input.setRange(TILT_MIN_DEG, TILT_MAX_DEG)
             self.tilt_input.setDecimals(2)
             self.tilt_input.setSingleStep(MOOG_RESOLUTION_DEG)
+            self.tilt_input.valueChanged.connect(self.mark_goto_inputs_dirty)
+            self.tilt_input.lineEdit().textEdited.connect(self.mark_goto_inputs_dirty)
             goto_btn = QtWidgets.QPushButton("Go to")
             goto_btn.clicked.connect(self.goto_inputs)
             goto_layout.addWidget(self.pan_input)
@@ -1500,6 +1505,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             "total": len(dtilts),
                             "dtilt": float(dtilt),
                             "filepath": filepath,
+                            "status": moog_status,
                         },
                         None,
                     ))
@@ -1546,13 +1552,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         self.auto_job_running = False
                         self.stop_acquisition_btn.setEnabled(False)
                     elif kind == "moog_open":
-                        self.moog_status_timer.stop()
                         self.set_moog_home_enabled(False)
                         self.set_switch_pair("moog_switch", False)
                     elif kind == "moog_close":
                         self.set_switch_pair("moog_switch", True)
                     elif kind == "status":
-                        self.moog_status_timer.stop()
                         self.set_moog_home_enabled(False)
                         self.set_switch_pair("moog_switch", False)
                     elif kind == "camera_open":
@@ -1582,24 +1586,28 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.current_status = status
                     self.log_msg(message)
                     self.apply_status()
+                elif kind == "goto":
+                    message, status = result
+                    self.current_status = status
+                    self.goto_inputs_dirty = False
+                    self.log_msg(message)
+                    self.apply_status()
                 elif kind == "status":
                     self.current_status = result
+                    self.log_msg(
+                        f"Position refreshed: pan={result.pan_deg:.2f} deg, tilt={result.tilt_deg:.2f} deg"
+                    )
                     self.apply_status()
                 elif kind == "moog_open":
                     message, status = result
                     self.current_status = status
                     self.set_switch_pair("moog_switch", bool(status.connected))
                     self.set_moog_home_enabled(bool(status.connected))
-                    if status.connected:
-                        self.moog_status_timer.start()
-                    else:
-                        self.moog_status_timer.stop()
                     self.log_msg(message if status.connected else "Moog open failed: controller did not report connected")
                     self.apply_status()
                 elif kind == "moog_close":
                     message, status = result
                     self.current_status = status
-                    self.moog_status_timer.stop()
                     self.set_moog_home_enabled(False)
                     self.set_switch_pair("moog_switch", bool(status.connected))
                     self.log_msg(message)
@@ -1650,9 +1658,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             f"correction dpan={result['applied_dpan_deg']:.4f}, dtilt={result['applied_dtilt_deg']:.4f}"
                         )
                     else:
+                        self.log_msg(self.center_failure_message(result.get("info", {})))
                         self.apply_status()
                 elif kind == "stop":
-                    self.moog_status_timer.stop()
                     self.set_moog_home_enabled(False)
                     self.log_msg(result)
                     self.apply_status()
@@ -1670,6 +1678,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             f"{result['acquisitions']} acquisitions saved to {result['filepath']}"
                         )
                 elif kind == "auto_progress":
+                    self.current_status = result["status"]
+                    self.apply_status()
                     self.log_msg(
                         f"Auto scan acquisition {result['aq_num'] + 1}/{result['total']}, "
                         f"dtilt={result['dtilt']:.2f}, file={result['filepath']}"
@@ -1732,7 +1742,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     switch.blockSignals(False)
 
         def set_moog_home_enabled(self, enabled):
-            for button_name in ("home_btn", "auto_home_btn"):
+            for button_name in (
+                "home_btn",
+                "auto_home_btn",
+                "refresh_position_btn",
+                "auto_refresh_position_btn",
+            ):
                 button = getattr(self, button_name, None)
                 if button is not None:
                     button.setEnabled(bool(enabled))
@@ -1770,9 +1785,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.submit_worker("moog_open", task)
 
         def request_moog_status(self):
-            if self.status_pending or not self.current_status.connected:
+            if self.status_pending:
+                return
+            if not self.current_status.connected:
+                self.log_msg("Cannot refresh position: Moog is not open")
                 return
             self.status_pending = True
+            self.log_msg("Refreshing Moog position...")
 
             def task():
                 with self.motion_lock:
@@ -1784,26 +1803,25 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             if self.auto_job_running:
                 self.log_msg("Cannot reset Moog while acquisition is running")
                 return
-            self.log_msg("Returning Moog to home...")
+            self.log_msg("Returning Moog to zero: pan first, then tilt...")
 
             def task():
                 with self.motion_lock:
                     status = self.moog.home()
                     self.current_status = status
-                return "Moog returned home", status
+                return "Moog returned to zero: pan then tilt completed", status
 
             self.submit_worker("moog_home", task)
 
         def close_moog(self):
-            self.log_msg("Closing Moog: homing first...")
-            self.moog_status_timer.stop()
+            self.log_msg("Closing Moog: returning pan to zero, then tilt to zero...")
             self.set_moog_home_enabled(False)
 
             def task():
                 with self.motion_lock:
                     self.moog.close()
                     status = self.moog.get_status()
-                return "Moog homed and closed", status
+                return "Moog returned to zero in order and closed", status
 
             self.submit_worker("moog_close", task)
 
@@ -1861,7 +1879,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.stop_acquisition_event.set()
             self.stop_acquisition_btn.setEnabled(False)
             self.timer.stop()
-            self.moog_status_timer.stop()
             self.set_moog_home_enabled(False)
             self.set_switch_pair("camera_switch", False)
             self.set_switch_pair("pol_switch", False)
@@ -1923,17 +1940,16 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 return
             self.camera_pending = True
             auto_exposure = self.auto_exposure_check.isChecked()
+            pan_deg = self.current_status.pan_deg
+            tilt_deg = self.current_status.tilt_deg
 
             def task():
-                with self.motion_lock:
-                    status = self.moog.get_status()
-                    self.current_status = status
                 with self.camera_lock:
-                    frame = self.camera.get_frame(status.pan_deg, status.tilt_deg)
+                    frame = self.camera.get_frame(pan_deg, tilt_deg)
                     exposure_info = None
                     if auto_exposure:
                         exposure_info = self.calculate_auto_exposure(frame)
-                        frame = self.camera.get_frame(status.pan_deg, status.tilt_deg)
+                        frame = self.camera.get_frame(pan_deg, tilt_deg)
                 center, _ = detect_sun_center(frame)
                 return frame, center, exposure_info
 
@@ -1943,8 +1959,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             status = self.current_status
             self.pan_display.set_value(status.pan_deg)
             self.tilt_display.set_value(status.tilt_deg)
-            self.pan_input.setValue(status.pan_deg)
-            self.tilt_input.setValue(status.tilt_deg)
+            if not self.goto_inputs_dirty:
+                self.pan_input.blockSignals(True)
+                self.tilt_input.blockSignals(True)
+                self.pan_input.setValue(status.pan_deg)
+                self.tilt_input.setValue(status.tilt_deg)
+                self.pan_input.blockSignals(False)
+                self.tilt_input.blockSignals(False)
             center_line = "Sun center: none"
             if self.last_center_result:
                 if self.last_center_result.get("ok"):
@@ -1978,8 +1999,20 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             self.submit_worker("motion", task)
 
+        def mark_goto_inputs_dirty(self, _value=None):
+            self.goto_inputs_dirty = True
+
         def goto_inputs(self):
-            self.remote_goto(self.pan_input.value(), self.tilt_input.value())
+            pan = self.pan_input.value()
+            tilt = self.tilt_input.value()
+
+            def task():
+                with self.motion_lock:
+                    status = self.moog.move_absolute(pan, tilt)
+                    self.current_status = status
+                return f"Moved to pan={pan:.2f}, tilt={tilt:.2f}", status
+
+            self.submit_worker("goto", task)
 
         def set_polarizer(self, angle):
             def task():
@@ -1990,8 +2023,24 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.submit_worker("polarizer", task)
 
         def center_sun(self):
+            self.log_msg("Center sun requested: searching current camera frame")
             self.remote_center()
             self.apply_status()
+
+        def center_failure_message(self, info):
+            reason = info.get("reason", "unknown detection failure")
+            messages = {
+                "camera not open": "Sun centering failed: camera is not open",
+                "empty frame": "Sun centering failed: camera frame is empty",
+                "low contrast": "Sun centering failed: image contrast is too low; no solar disk detected",
+                "no bright component": "Sun centering failed: no sun-like bright region detected in the frame",
+                "component too small": "Sun centering failed: detected bright region is too small to identify as the sun",
+                "no bright pixels": "Sun centering failed: no bright solar pixels detected in the frame",
+            }
+            message = messages.get(reason, f"Sun centering failed: {reason}")
+            if "area" in info:
+                message += f" (area={info['area']} px)"
+            return message
 
         def remote_status(self):
             status = self.current_status
@@ -2045,6 +2094,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             deg_per_pixel = self.deg_per_pixel.value()
 
             def task():
+                if not bool(getattr(self.camera, "connected", False)):
+                    return {"ok": False, "info": {"reason": "camera not open"}}
+
                 local_frame = frame
                 with self.motion_lock:
                     status = self.moog.get_status()
@@ -2167,7 +2219,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def closeEvent(self, event):
             self.toggle_remote(False)
             self.timer.stop()
-            self.moog_status_timer.stop()
             self.result_timer.stop()
             self.auto_monitor_timer.stop()
             try:
