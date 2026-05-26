@@ -62,6 +62,8 @@ AUTO_EXPOSURE_MIN_US = 500.0
 AUTO_EXPOSURE_MAX_US = 1_000_000.0
 AUTO_EXPOSURE_SATURATION_FRACTION = 0.97
 UV_BIT_DEPTH = 12
+DEFAULT_MOOG_PORT = "COM7"
+DEFAULT_ZABER_PORT = "COM6"
 
 
 def quantize_pointing(value: float) -> float:
@@ -260,8 +262,17 @@ class RealMoogController:
             return self.status
 
         self.mf.mv_to_home(self.serial_port, 0, 0)
-        time.sleep(0.5)
-        return self.get_status()
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            status = self.get_status()
+            at_home = abs(status.pan_deg) <= 0.15 and abs(status.tilt_deg) <= 0.15
+            if status.move_complete and at_home:
+                return status
+            time.sleep(0.1)
+        raise TimeoutError(
+            "Moog failed to settle at home; "
+            f"last actual pan={self.status.pan_deg:.1f}, tilt={self.status.tilt_deg:.1f}."
+        )
 
     def move_absolute(self, pan_deg: float, tilt_deg: float):
         if not self.serial_port or not self.serial_port.is_open:
@@ -428,18 +439,19 @@ class RealVmbCameraController:
         if self.vmb_cm:
             self.vmb_cm.__exit__(None, None, None)
             self.vmb_cm = None
+        self.camera = None
         self.connected = False
 
     def set_exposure(self, exposure_us: float):
         self.exposure_us = float(np.clip(exposure_us, AUTO_EXPOSURE_MIN_US, AUTO_EXPOSURE_MAX_US))
-        if self.camera:
+        if self.connected and self.camera is not None:
             self.uv.setup_camera(self.camera, self.exposure_us)
 
     def get_exposure(self):
         return self.exposure_us
 
     def get_frame(self, pan_deg: float = 0.0, tilt_deg: float = 0.0):
-        if not self.camera:
+        if not self.connected or self.camera is None:
             raise RuntimeError("Camera is not open.")
         frame = self.camera.get_frame()
         data = np.frombuffer(frame.get_buffer(), dtype=np.uint16)
@@ -776,6 +788,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.camera_lock = threading.RLock()
             self.result_queue = queue.Queue()
             self.camera_pending = False
+            self.status_pending = False
             self.current_status = self.moog.get_status()
 
             self.timer = QtCore.QTimer(self)
@@ -786,6 +799,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.result_timer.setInterval(50)
             self.result_timer.timeout.connect(self.process_worker_results)
             self.result_timer.start()
+
+            self.moog_status_timer = QtCore.QTimer(self)
+            self.moog_status_timer.setInterval(200)
+            self.moog_status_timer.timeout.connect(self.request_moog_status)
 
             self.auto_monitor_timer = QtCore.QTimer(self)
             self.auto_monitor_timer.timeout.connect(self.check_sun_trigger)
@@ -841,11 +858,14 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.auto_moog_switch = make_switch("Moog")
             self.auto_camera_switch = make_switch("Camera")
             self.auto_pol_switch = make_switch("Polarizer")
+            self.auto_home_btn = QtWidgets.QPushButton("Home / Reset")
+            self.auto_home_btn.setEnabled(False)
             self.auto_stop_btn = QtWidgets.QPushButton("STOP - close all")
             self.auto_stop_btn.setStyleSheet("background: #b00020; color: white; font-weight: 700;")
             self.auto_moog_switch.toggled.connect(self.toggle_moog)
             self.auto_camera_switch.toggled.connect(self.toggle_camera)
             self.auto_pol_switch.toggled.connect(self.toggle_polarizer)
+            self.auto_home_btn.clicked.connect(self.home_moog)
             self.auto_stop_btn.clicked.connect(self.stop_all)
             auto_connection_layout.addWidget(self.auto_sim_check, 0, 0)
             auto_connection_layout.addWidget(self.auto_refresh_btn, 0, 1)
@@ -857,7 +877,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_connection_layout.addWidget(QtWidgets.QLabel("Polarizer"), 3, 0)
             auto_connection_layout.addWidget(self.auto_pol_port, 3, 1)
             auto_connection_layout.addWidget(self.auto_pol_switch, 3, 2)
-            auto_connection_layout.addWidget(self.auto_stop_btn, 4, 0, 1, 3)
+            auto_connection_layout.addWidget(self.auto_home_btn, 4, 0)
+            auto_connection_layout.addWidget(self.auto_stop_btn, 4, 1, 1, 2)
 
             scan_group = QtWidgets.QGroupBox("Auto Scan")
             scan_layout = QtWidgets.QGridLayout(scan_group)
@@ -1037,7 +1058,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.stop_btn.setMinimumHeight(30)
             self.stop_btn.setStyleSheet("background: #b00020; color: white; font-weight: 700;")
             self.stop_btn.clicked.connect(self.stop_all)
-            connection_layout.addWidget(self.stop_btn, 4, 0, 1, 3)
+            self.home_btn = QtWidgets.QPushButton("Home / Reset")
+            self.home_btn.setEnabled(False)
+            self.home_btn.clicked.connect(self.home_moog)
+            connection_layout.addWidget(self.home_btn, 4, 0)
+            connection_layout.addWidget(self.stop_btn, 4, 1, 1, 2)
 
             status_group = QtWidgets.QGroupBox("Pointing")
             status_layout = QtWidgets.QVBoxLayout(status_group)
@@ -1513,15 +1538,23 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
                 if kind == "frame":
                     self.camera_pending = False
+                elif kind == "status":
+                    self.status_pending = False
 
                 if error is not None:
                     if kind == "auto_trigger":
                         self.auto_job_running = False
                         self.stop_acquisition_btn.setEnabled(False)
                     elif kind == "moog_open":
+                        self.moog_status_timer.stop()
+                        self.set_moog_home_enabled(False)
                         self.set_switch_pair("moog_switch", False)
                     elif kind == "moog_close":
                         self.set_switch_pair("moog_switch", True)
+                    elif kind == "status":
+                        self.moog_status_timer.stop()
+                        self.set_moog_home_enabled(False)
+                        self.set_switch_pair("moog_switch", False)
                     elif kind == "camera_open":
                         self.timer.stop()
                         self.set_switch_pair("camera_switch", False)
@@ -1549,22 +1582,39 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.current_status = status
                     self.log_msg(message)
                     self.apply_status()
+                elif kind == "status":
+                    self.current_status = result
+                    self.apply_status()
                 elif kind == "moog_open":
                     message, status = result
                     self.current_status = status
                     self.set_switch_pair("moog_switch", bool(status.connected))
+                    self.set_moog_home_enabled(bool(status.connected))
+                    if status.connected:
+                        self.moog_status_timer.start()
+                    else:
+                        self.moog_status_timer.stop()
                     self.log_msg(message if status.connected else "Moog open failed: controller did not report connected")
                     self.apply_status()
                 elif kind == "moog_close":
                     message, status = result
                     self.current_status = status
+                    self.moog_status_timer.stop()
+                    self.set_moog_home_enabled(False)
                     self.set_switch_pair("moog_switch", bool(status.connected))
+                    self.log_msg(message)
+                    self.apply_status()
+                elif kind == "moog_home":
+                    message, status = result
+                    self.current_status = status
                     self.log_msg(message)
                     self.apply_status()
                 elif kind == "camera_open":
                     message, connected = result
                     self.set_switch_pair("camera_switch", bool(connected))
-                    if not connected:
+                    if connected:
+                        self.timer.start()
+                    else:
                         self.timer.stop()
                         self.camera_view.clear()
                         self.camera_view.setText("Camera closed")
@@ -1574,6 +1624,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     message, connected = result
                     self.set_switch_pair("camera_switch", bool(connected))
                     self.log_msg(message)
+                    self.apply_status()
+                elif kind == "camera":
+                    self.log_msg(result)
                     self.apply_status()
                 elif kind == "polarizer_open":
                     message, connected = result
@@ -1599,6 +1652,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     else:
                         self.apply_status()
                 elif kind == "stop":
+                    self.moog_status_timer.stop()
+                    self.set_moog_home_enabled(False)
                     self.log_msg(result)
                     self.apply_status()
                 elif kind == "auto_trigger":
@@ -1639,15 +1694,24 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.apply_status()
 
         def refresh_ports(self):
-            ports = ["SIM"]
+            ports = [DEFAULT_MOOG_PORT, DEFAULT_ZABER_PORT, "SIM"]
             if serial is not None:
                 ports += [p.device for p in serial.tools.list_ports.comports()]
-            for combo in (self.moog_port, self.pol_port, self.auto_moog_port, self.auto_pol_port):
+            ports = list(dict.fromkeys(ports))
+            port_combos = (
+                (self.moog_port, DEFAULT_MOOG_PORT),
+                (self.pol_port, DEFAULT_ZABER_PORT),
+                (self.auto_moog_port, DEFAULT_MOOG_PORT),
+                (self.auto_pol_port, DEFAULT_ZABER_PORT),
+            )
+            for combo, default_port in port_combos:
                 current = combo.currentText()
                 combo.clear()
                 combo.addItems(ports)
                 if current in ports:
                     combo.setCurrentText(current)
+                else:
+                    combo.setCurrentText(default_port)
 
         def selected_moog_port(self):
             if self.pages.currentIndex() == 0:
@@ -1666,6 +1730,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     switch.blockSignals(True)
                     switch.setChecked(checked)
                     switch.blockSignals(False)
+
+        def set_moog_home_enabled(self, enabled):
+            for button_name in ("home_btn", "auto_home_btn"):
+                button = getattr(self, button_name, None)
+                if button is not None:
+                    button.setEnabled(bool(enabled))
 
         def toggle_moog(self, checked):
             self.set_switch_pair("moog_switch", checked)
@@ -1699,8 +1769,35 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             self.submit_worker("moog_open", task)
 
+        def request_moog_status(self):
+            if self.status_pending or not self.current_status.connected:
+                return
+            self.status_pending = True
+
+            def task():
+                with self.motion_lock:
+                    return self.moog.get_status()
+
+            self.submit_worker("status", task)
+
+        def home_moog(self):
+            if self.auto_job_running:
+                self.log_msg("Cannot reset Moog while acquisition is running")
+                return
+            self.log_msg("Returning Moog to home...")
+
+            def task():
+                with self.motion_lock:
+                    status = self.moog.home()
+                    self.current_status = status
+                return "Moog returned home", status
+
+            self.submit_worker("moog_home", task)
+
         def close_moog(self):
             self.log_msg("Closing Moog: homing first...")
+            self.moog_status_timer.stop()
+            self.set_moog_home_enabled(False)
 
             def task():
                 with self.motion_lock:
@@ -1722,7 +1819,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 return "Camera opened", connected
 
             self.submit_worker("camera_open", task)
-            self.timer.start()
 
         def close_camera(self):
             self.timer.stop()
@@ -1765,6 +1861,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.stop_acquisition_event.set()
             self.stop_acquisition_btn.setEnabled(False)
             self.timer.stop()
+            self.moog_status_timer.stop()
+            self.set_moog_home_enabled(False)
             self.set_switch_pair("camera_switch", False)
             self.set_switch_pair("pol_switch", False)
             self.set_switch_pair("moog_switch", False)
@@ -2069,6 +2167,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def closeEvent(self, event):
             self.toggle_remote(False)
             self.timer.stop()
+            self.moog_status_timer.stop()
             self.result_timer.stop()
             self.auto_monitor_timer.stop()
             try:
