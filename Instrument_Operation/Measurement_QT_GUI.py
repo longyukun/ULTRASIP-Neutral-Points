@@ -66,6 +66,7 @@ AUTO_EXPOSURE_SATURATION_FRACTION = 0.97
 UV_BIT_DEPTH = 12
 DEFAULT_MOOG_PORT = "COM7"
 DEFAULT_ZABER_PORT = "COM6"
+AUTO_SCAN_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".ultrasip_auto_scan_settings.json")
 
 
 def quantize_pointing(value: float) -> float:
@@ -126,6 +127,15 @@ def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) 
     )
     azimuth = (math.degrees(az) + 180.0) % 360.0
     return azimuth, altitude
+
+
+def azimuth_to_moog_pan(azimuth_deg: float) -> float:
+    """Convert compass azimuth to Moog pan when pan=0 points south."""
+    return (float(azimuth_deg) % 360.0) - 180.0
+
+
+def moog_pan_to_azimuth(pan_deg: float) -> float:
+    return (180.0 + float(pan_deg)) % 360.0
 
 
 def import_qt():
@@ -375,9 +385,12 @@ class SimCameraController:
         self.exposure_us = float(exposure_us)
         self.width = UV_IMAGE_WIDTH_PX
         self.height = UV_IMAGE_HEIGHT_PX
-        self.sun_x = self.width * 0.62
-        self.sun_y = self.height * 0.42
+        self.sun_x = self.width * 0.5
+        self.sun_y = self.height * 0.5
         self.pixels_per_degree = 1.0 / UV_DEG_PER_PIXEL
+        self.latitude_deg = 32.23134
+        self.longitude_deg = -110.94712
+        self.pan_mount_offset_deg = float(np.random.default_rng().uniform(-10.0, 10.0))
 
     def open(self):
         self.connected = True
@@ -391,13 +404,28 @@ class SimCameraController:
     def get_exposure(self):
         return self.exposure_us
 
+    def set_site(self, latitude_deg: float, longitude_deg: float):
+        self.latitude_deg = float(latitude_deg)
+        self.longitude_deg = float(longitude_deg)
+
+    def reset_mount_offset(self):
+        self.pan_mount_offset_deg = float(np.random.default_rng().uniform(-10.0, 10.0))
+
+    @staticmethod
+    def azimuth_error_deg(target_azimuth_deg: float, pointing_azimuth_deg: float):
+        return (float(target_azimuth_deg) - float(pointing_azimuth_deg) + 180.0) % 360.0 - 180.0
+
     def get_frame(self, pan_deg: float = 0.0, tilt_deg: float = 0.0):
         self.frame_index += 1
         yy, xx = np.mgrid[0:self.height, 0:self.width]
         drift_x = 22.0 * math.sin(self.frame_index / 28.0)
         drift_y = 14.0 * math.cos(self.frame_index / 31.0)
-        cx = self.sun_x + pan_deg * self.pixels_per_degree + drift_x
-        cy = self.sun_y + tilt_deg * self.pixels_per_degree + drift_y
+        sun_azimuth, sun_altitude = solar_position_deg(datetime.now(), self.latitude_deg, self.longitude_deg)
+        pointing_azimuth = moog_pan_to_azimuth(float(pan_deg) + self.pan_mount_offset_deg)
+        pan_error = self.azimuth_error_deg(sun_azimuth, pointing_azimuth)
+        tilt_error = sun_altitude - float(tilt_deg)
+        cx = self.sun_x + pan_error * self.pixels_per_degree + drift_x
+        cy = self.sun_y - tilt_error * self.pixels_per_degree + drift_y
 
         sky = 250.0 + 20.0 * np.sin(xx / 180.0) + 10.0 * np.cos(yy / 130.0)
         disk = 3500.0 * np.exp(-(((xx - cx) ** 2) + ((yy - cy) ** 2)) / (2 * 35.0 ** 2))
@@ -695,6 +723,55 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             )
             self.setPixmap(scaled)
 
+    class AutoScanPreviewTile(QtWidgets.QWidget):
+        def __init__(self, title):
+            super().__init__()
+            self.title = title
+            self.image_label = QtWidgets.QLabel(title)
+            self.image_label.setFixedSize(150, 150)
+            self.image_label.setAlignment(align_center)
+            self.image_label.setStyleSheet("background: #111; color: #ddd; border: 1px solid #444;")
+            self.text_label = QtWidgets.QLabel(title)
+            self.text_label.setAlignment(align_center)
+            self.text_label.setWordWrap(True)
+            self.text_label.setStyleSheet("font-size: 9px;")
+            layout = QtWidgets.QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(3)
+            layout.addWidget(self.image_label)
+            layout.addWidget(self.text_label)
+            self.last_pixmap = None
+
+        def set_frame(self, frame, text=None):
+            if text is not None:
+                self.title = text
+            image = np.asarray(frame)
+            if image.ndim == 2:
+                max_side = max(image.shape)
+                step = max(1, int(math.ceil(max_side / 300.0)))
+                image = image[::step, ::step]
+            qimage = frame_to_qimage(image, QtGui)
+            self.last_pixmap = QtGui.QPixmap.fromImage(qimage)
+            if text is not None:
+                self.text_label.setText(text)
+            self._rescale()
+
+        def clear_frame(self):
+            self.last_pixmap = None
+            self.image_label.clear()
+            self.image_label.setText(self.title)
+            self.text_label.setText(self.title)
+
+        def resizeEvent(self, event):
+            super().resizeEvent(event)
+            self._rescale()
+
+        def _rescale(self):
+            if not self.last_pixmap:
+                return
+            scaled = self.last_pixmap.scaled(self.image_label.size(), keep_aspect, smooth_transform)
+            self.image_label.setPixmap(scaled)
+
     class DigitAxisWidget(QtWidgets.QWidget):
         def __init__(self, name, move_callback):
             super().__init__()
@@ -779,8 +856,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.tilt_offset = 0.0
             self.calibration_complete = False
             self.completed_sun_targets = set()
+            self.queued_sun_trigger = None
+            self.last_sun_altitude = None
+            self.sun_trigger_enabled = True
             self.auto_monitoring = False
             self.auto_job_running = False
+            self.auto_stop_requested = False
             self.stop_acquisition_event = threading.Event()
             self.remote_server = None
             self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="ultrasip-gui")
@@ -918,10 +999,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.start_tilt_input.setRange(0.0, 90.0)
             self.start_tilt_input.setDecimals(1)
             self.start_tilt_input.setValue(0.0)
-            self.end_tilt_input = QtWidgets.QDoubleSpinBox()
-            self.end_tilt_input.setRange(0.0, 90.0)
-            self.end_tilt_input.setDecimals(1)
-            self.end_tilt_input.setValue(4.0)
             self.scan_step_tilt_input = QtWidgets.QDoubleSpinBox()
             self.scan_step_tilt_input.setRange(0.1, 20.0)
             self.scan_step_tilt_input.setDecimals(1)
@@ -931,66 +1008,35 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.output_dir_input = QtWidgets.QLineEdit(os.getcwd())
             self.browse_output_btn = QtWidgets.QPushButton("Browse")
             self.browse_output_btn.clicked.connect(self.browse_output_dir)
-            self.run_now_btn = QtWidgets.QPushButton("Run Auto Scan Now")
-            self.run_now_btn.clicked.connect(self.run_auto_scan_now)
-            self.stop_acquisition_btn = QtWidgets.QPushButton("Stop Acquisition")
-            self.stop_acquisition_btn.setEnabled(False)
-            self.stop_acquisition_btn.setStyleSheet("background: #9a3412; color: white; font-weight: 700;")
-            self.stop_acquisition_btn.clicked.connect(self.stop_acquisition)
+            self.load_auto_scan_settings()
+            self.run_now_btn = QtWidgets.QPushButton()
+            self.run_now_btn.clicked.connect(self.auto_scan_button_clicked)
+            self.set_auto_scan_button_state("idle")
+            self.settings_btn = QtWidgets.QPushButton("Acquisition Settings...")
+            self.settings_btn.clicked.connect(self.open_auto_scan_settings)
+            self.settings_summary_label = QtWidgets.QLabel("")
+            self.settings_summary_label.setWordWrap(True)
             self.sun_status_label = QtWidgets.QLabel("Sun trigger monitor stopped")
             self.sun_status_label.setWordWrap(True)
-            self.sun_trigger_switch = make_switch("Sun Trigger")
-            self.sun_trigger_switch.toggled.connect(self.toggle_sun_monitor)
 
             row = 1
-            scan_layout.addWidget(QtWidgets.QLabel("Latitude"), row, 0)
-            scan_layout.addWidget(self.latitude_input, row, 1)
+            scan_layout.addWidget(self.settings_btn, row, 0, 1, 2)
             row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Longitude"), row, 0)
-            scan_layout.addWidget(self.longitude_input, row, 1)
+            scan_layout.addWidget(self.settings_summary_label, row, 0, 1, 2)
             row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Target start altitude [deg]"), row, 0)
-            scan_layout.addWidget(self.target_start_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Target end altitude [deg]"), row, 0)
-            scan_layout.addWidget(self.target_end_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Target step [deg]"), row, 0)
-            scan_layout.addWidget(self.target_step_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Tolerance [deg]"), row, 0)
-            scan_layout.addWidget(self.tolerance_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Check interval [sec]"), row, 0)
-            scan_layout.addWidget(self.check_interval_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Scan start tilt offset [deg]"), row, 0)
-            scan_layout.addWidget(self.start_tilt_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Scan end tilt offset [deg]"), row, 0)
-            scan_layout.addWidget(self.end_tilt_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Scan step tilt [deg]"), row, 0)
-            scan_layout.addWidget(self.scan_step_tilt_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), row, 0)
-            scan_layout.addWidget(self.polarizer_angles_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Location"), row, 0)
-            scan_layout.addWidget(self.location_input, row, 1)
-            row += 1
-            scan_layout.addWidget(QtWidgets.QLabel("Output folder"), row, 0)
-            output_row = QtWidgets.QHBoxLayout()
-            output_row.addWidget(self.output_dir_input)
-            output_row.addWidget(self.browse_output_btn)
-            scan_layout.addLayout(output_row, row, 1)
-            row += 1
-            scan_layout.addWidget(self.run_now_btn, row, 0)
-            scan_layout.addWidget(self.stop_acquisition_btn, row, 1)
-            row += 1
-            scan_layout.addWidget(self.sun_trigger_switch, row, 0, 1, 2)
+            scan_layout.addWidget(self.run_now_btn, row, 0, 1, 2)
             row += 1
             scan_layout.addWidget(self.sun_status_label, row, 0, 1, 2)
+            self.update_settings_summary()
+
+            preview_group = QtWidgets.QGroupBox("Acquisition 0 Preview")
+            preview_layout = QtWidgets.QGridLayout(preview_group)
+            self.auto_preview_labels = []
+            for preview_idx in range(4):
+                label = AutoScanPreviewTile(f"Image {preview_idx + 1}")
+                self.auto_preview_labels.append(label)
+                preview_layout.addWidget(label, 0, preview_idx)
+            auto_layout.addWidget(preview_group)
 
             self.auto_log = QtWidgets.QPlainTextEdit()
             style_log_box(self.auto_log)
@@ -1212,6 +1258,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 if log is not None:
                     log.appendPlainText(self.last_message)
 
+        def update_sim_camera_site(self):
+            if isinstance(self.camera, SimCameraController):
+                self.camera.set_site(self.latitude_input.value(), self.longitude_input.value())
+
         def fit_camera_preview(self):
             self.preview_fit = True
             self.zoom_slider.blockSignals(True)
@@ -1244,7 +1294,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
         def finish_calibration(self):
             self.pan_offset = quantize_pointing(self.pan_offset_input.value())
-            self.tilt_offset = 0.0
+            self.save_auto_scan_settings()
             self.calibration_complete = True
             self.update_auto_calibration_labels()
             self.pages.setCurrentIndex(0)
@@ -1276,6 +1326,236 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             if path:
                 self.output_dir_input.setText(path)
 
+        def auto_scan_settings_payload(self):
+            return {
+                "latitude": self.latitude_input.value(),
+                "longitude": self.longitude_input.value(),
+                "target_start": self.target_start_input.value(),
+                "target_end": self.target_end_input.value(),
+                "target_step": self.target_step_input.value(),
+                "tolerance": self.tolerance_input.value(),
+                "check_interval": self.check_interval_input.value(),
+                "pan_offset": self.pan_offset,
+                "tilt_offset": self.tilt_offset,
+                "start_tilt": self.start_tilt_input.value(),
+                "scan_step_tilt": self.scan_step_tilt_input.value(),
+                "polarizer_angles": self.polarizer_angles_input.text().strip(),
+                "location": self.location_input.text().strip(),
+                "output_dir": self.output_dir_input.text().strip(),
+                "sun_trigger_enabled": bool(self.sun_trigger_enabled),
+            }
+
+        def apply_auto_scan_settings_payload(self, settings):
+            setters = (
+                ("latitude", self.latitude_input.setValue),
+                ("longitude", self.longitude_input.setValue),
+                ("target_start", self.target_start_input.setValue),
+                ("target_end", self.target_end_input.setValue),
+                ("target_step", self.target_step_input.setValue),
+                ("tolerance", self.tolerance_input.setValue),
+                ("check_interval", self.check_interval_input.setValue),
+                ("start_tilt", self.start_tilt_input.setValue),
+                ("scan_step_tilt", self.scan_step_tilt_input.setValue),
+            )
+            for key, setter in setters:
+                if key in settings:
+                    setter(settings[key])
+            if "polarizer_angles" in settings:
+                self.polarizer_angles_input.setText(str(settings["polarizer_angles"]))
+            if "location" in settings:
+                self.location_input.setText(str(settings["location"]))
+            if "output_dir" in settings:
+                self.output_dir_input.setText(str(settings["output_dir"]))
+            if "pan_offset" in settings:
+                self.pan_offset = quantize_pointing(settings["pan_offset"])
+            if "tilt_offset" in settings:
+                self.tilt_offset = quantize_pointing(settings["tilt_offset"])
+            self.sun_trigger_enabled = bool(settings.get("sun_trigger_enabled", True))
+
+        def load_auto_scan_settings(self):
+            try:
+                with open(AUTO_SCAN_SETTINGS_PATH, "r", encoding="utf-8") as handle:
+                    settings = json.load(handle)
+            except FileNotFoundError:
+                return
+            except Exception as exc:
+                self.log_msg(f"Could not load auto scan settings: {exc}")
+                return
+            if isinstance(settings, dict):
+                self.apply_auto_scan_settings_payload(settings)
+
+        def save_auto_scan_settings(self):
+            settings = self.auto_scan_settings_payload()
+            os.makedirs(os.path.dirname(AUTO_SCAN_SETTINGS_PATH), exist_ok=True)
+            with open(AUTO_SCAN_SETTINGS_PATH, "w", encoding="utf-8") as handle:
+                json.dump(settings, handle, indent=2, sort_keys=True)
+
+        def update_settings_summary(self):
+            if not hasattr(self, "settings_summary_label"):
+                return
+            self.settings_summary_label.setText(
+                "Location={location}, output={output}\n"
+                "Sun trigger={sun_trigger}; targets {start:.1f}-{end:.1f} deg step {step:.1f}, tol {tol:.2f}, check {interval:d}s\n"
+                "Offsets pan={pan_offset:.2f}, tilt={tilt_offset:.2f}; scan dtilt start {tilt_start:.1f}, step {tilt_step:.1f}\n"
+                "Polarizer={angles}".format(
+                    location=self.location_input.text().strip() or "ULTRASIP",
+                    output=self.output_dir_input.text().strip() or os.getcwd(),
+                    sun_trigger="ON" if self.sun_trigger_enabled else "OFF",
+                    start=self.target_start_input.value(),
+                    end=self.target_end_input.value(),
+                    step=self.target_step_input.value(),
+                    tol=self.tolerance_input.value(),
+                    interval=self.check_interval_input.value(),
+                    pan_offset=self.pan_offset,
+                    tilt_offset=self.tilt_offset,
+                    tilt_start=self.start_tilt_input.value(),
+                    tilt_step=self.scan_step_tilt_input.value(),
+                    angles=self.polarizer_angles_input.text().strip(),
+                )
+            )
+
+        def open_auto_scan_settings(self):
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Acquisition Settings")
+            layout = QtWidgets.QGridLayout(dialog)
+            fields = {}
+
+            def add_double(row, key, label, source, min_value, max_value, decimals, step=None):
+                widget = QtWidgets.QDoubleSpinBox()
+                widget.setRange(min_value, max_value)
+                widget.setDecimals(decimals)
+                if step is not None:
+                    widget.setSingleStep(step)
+                widget.setValue(source.value())
+                layout.addWidget(QtWidgets.QLabel(label), row, 0)
+                layout.addWidget(widget, row, 1)
+                fields[key] = widget
+
+            sun_trigger_enabled = make_switch("Sun Trigger")
+            sun_trigger_enabled.setChecked(bool(self.sun_trigger_enabled))
+            layout.addWidget(QtWidgets.QLabel("Sun trigger"), 0, 0)
+            layout.addWidget(sun_trigger_enabled, 0, 1)
+            fields["sun_trigger_enabled"] = sun_trigger_enabled
+
+            add_double(1, "latitude", "Latitude", self.latitude_input, -90.0, 90.0, 6)
+            add_double(2, "longitude", "Longitude", self.longitude_input, -180.0, 180.0, 6)
+            add_double(3, "target_start", "Target start altitude [deg]", self.target_start_input, -10.0, 90.0, 1, 0.1)
+            add_double(4, "target_end", "Target end altitude [deg]", self.target_end_input, -10.0, 90.0, 1, 0.1)
+            add_double(5, "target_step", "Target step [deg]", self.target_step_input, 0.1, 10.0, 1, 0.1)
+            add_double(6, "tolerance", "Tolerance [deg]", self.tolerance_input, 0.01, 5.0, 2, 0.01)
+
+            check_interval = QtWidgets.QSpinBox()
+            check_interval.setRange(1, 3600)
+            check_interval.setValue(self.check_interval_input.value())
+            layout.addWidget(QtWidgets.QLabel("Check interval [sec]"), 7, 0)
+            layout.addWidget(check_interval, 7, 1)
+            fields["check_interval"] = check_interval
+
+            pan_offset = QtWidgets.QDoubleSpinBox()
+            pan_offset.setRange(PAN_MIN_DEG, PAN_MAX_DEG)
+            pan_offset.setDecimals(2)
+            pan_offset.setSingleStep(MOOG_RESOLUTION_DEG)
+            pan_offset.setValue(self.pan_offset)
+            layout.addWidget(QtWidgets.QLabel("Pan offset [deg]"), 8, 0)
+            layout.addWidget(pan_offset, 8, 1)
+            fields["pan_offset"] = pan_offset
+
+            tilt_offset = QtWidgets.QDoubleSpinBox()
+            tilt_offset.setRange(TILT_MIN_DEG, TILT_MAX_DEG)
+            tilt_offset.setDecimals(2)
+            tilt_offset.setSingleStep(MOOG_RESOLUTION_DEG)
+            tilt_offset.setValue(self.tilt_offset)
+            layout.addWidget(QtWidgets.QLabel("Tilt offset [deg]"), 9, 0)
+            layout.addWidget(tilt_offset, 9, 1)
+            fields["tilt_offset"] = tilt_offset
+
+            add_double(10, "start_tilt", "Scan start tilt offset [deg]", self.start_tilt_input, 0.0, 90.0, 1, 0.1)
+            add_double(11, "scan_step_tilt", "Scan step tilt [deg]", self.scan_step_tilt_input, 0.1, 20.0, 1, 0.1)
+
+            polarizer_angles = QtWidgets.QLineEdit(self.polarizer_angles_input.text())
+            layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), 12, 0)
+            layout.addWidget(polarizer_angles, 12, 1)
+            fields["polarizer_angles"] = polarizer_angles
+
+            location = QtWidgets.QLineEdit(self.location_input.text())
+            layout.addWidget(QtWidgets.QLabel("Location"), 13, 0)
+            layout.addWidget(location, 13, 1)
+            fields["location"] = location
+
+            output_dir = QtWidgets.QLineEdit(self.output_dir_input.text())
+            browse = QtWidgets.QPushButton("Browse")
+            def browse_dialog_output():
+                path = QtWidgets.QFileDialog.getExistingDirectory(dialog, "Select Auto Scan Output Folder", output_dir.text())
+                if path:
+                    output_dir.setText(path)
+            browse.clicked.connect(browse_dialog_output)
+            output_row = QtWidgets.QHBoxLayout()
+            output_row.addWidget(output_dir)
+            output_row.addWidget(browse)
+            layout.addWidget(QtWidgets.QLabel("Output folder"), 14, 0)
+            layout.addLayout(output_row, 14, 1)
+            fields["output_dir"] = output_dir
+
+            dialog_buttons = getattr(QtWidgets.QDialogButtonBox, "StandardButton", QtWidgets.QDialogButtonBox)
+            buttons = QtWidgets.QDialogButtonBox(dialog_buttons.Save | dialog_buttons.Cancel)
+            layout.addWidget(buttons, 15, 0, 1, 2)
+
+            def save_and_close():
+                try:
+                    parsed_angles = []
+                    for part in fields["polarizer_angles"].text().split(","):
+                        part = part.strip()
+                        if part:
+                            parsed_angles.append(float(part))
+                    if not parsed_angles:
+                        raise ValueError("At least one polarizer angle is required.")
+                    self.latitude_input.setValue(fields["latitude"].value())
+                    self.longitude_input.setValue(fields["longitude"].value())
+                    self.target_start_input.setValue(fields["target_start"].value())
+                    self.target_end_input.setValue(fields["target_end"].value())
+                    self.target_step_input.setValue(fields["target_step"].value())
+                    self.tolerance_input.setValue(fields["tolerance"].value())
+                    self.check_interval_input.setValue(fields["check_interval"].value())
+                    self.pan_offset = quantize_pointing(fields["pan_offset"].value())
+                    self.tilt_offset = quantize_pointing(fields["tilt_offset"].value())
+                    self.start_tilt_input.setValue(fields["start_tilt"].value())
+                    self.scan_step_tilt_input.setValue(fields["scan_step_tilt"].value())
+                    self.polarizer_angles_input.setText(",".join(f"{angle:g}" for angle in parsed_angles))
+                    self.location_input.setText(fields["location"].text())
+                    self.output_dir_input.setText(fields["output_dir"].text())
+                    self.sun_trigger_enabled = bool(fields["sun_trigger_enabled"].isChecked())
+                    self.save_auto_scan_settings()
+                except Exception as exc:
+                    QtWidgets.QMessageBox.warning(dialog, "Invalid settings", str(exc))
+                    return
+                self.update_settings_summary()
+                self.log_msg(f"Auto scan settings saved to {AUTO_SCAN_SETTINGS_PATH}")
+                dialog.accept()
+
+            buttons.accepted.connect(save_and_close)
+            buttons.rejected.connect(dialog.reject)
+            dialog.exec()
+
+        def set_auto_scan_button_state(self, state):
+            if state == "idle":
+                self.run_now_btn.setText("Start Auto Scan")
+                self.run_now_btn.setEnabled(True)
+                self.run_now_btn.setStyleSheet("background: #15803d; color: white; font-weight: 700;")
+            elif state == "running":
+                self.run_now_btn.setText("Stop Auto Scan")
+                self.run_now_btn.setEnabled(True)
+                self.run_now_btn.setStyleSheet("background: #b91c1c; color: white; font-weight: 700;")
+            elif state == "stopping":
+                self.run_now_btn.setText("Stop requested")
+                self.run_now_btn.setEnabled(False)
+                self.run_now_btn.setStyleSheet("background: #6b7280; color: white; font-weight: 700;")
+
+        def auto_scan_button_clicked(self):
+            if self.auto_job_running or self.auto_monitoring:
+                self.stop_acquisition()
+            else:
+                self.run_auto_scan_now()
+
         def polarizer_angles(self):
             values = []
             for part in self.polarizer_angles_input.text().split(","):
@@ -1293,11 +1573,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "location": self.location_input.text().strip() or "ULTRASIP",
                 "output_dir": self.output_dir_input.text().strip() or os.getcwd(),
                 "start_tilt": self.start_tilt_input.value(),
-                "end_tilt": self.end_tilt_input.value(),
                 "step_tilt": self.scan_step_tilt_input.value(),
                 "angles": self.polarizer_angles(),
                 "pan_offset": self.pan_offset,
-                "tilt_offset": 0.0,
+                "tilt_offset": self.tilt_offset,
                 "uv_wavelength": "355 FWHM 10nm",
                 "auto_exposure": self.auto_exposure_check.isChecked(),
                 "target_median": self.target_median.value(),
@@ -1309,20 +1588,18 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             except Exception as exc:
                 self.log_msg(f"Auto scan config invalid: {exc}")
                 return
-            self.trigger_auto_measurement(None, None, None, datetime.now(), config=config)
-
-        def set_sun_trigger_switch(self, checked):
-            switch = getattr(self, "sun_trigger_switch", None)
-            if switch is not None and switch.isChecked() != checked:
-                switch.blockSignals(True)
-                switch.setChecked(checked)
-                switch.blockSignals(False)
-
-        def toggle_sun_monitor(self, checked):
-            if checked:
+            if self.sun_trigger_enabled:
                 self.start_sun_monitor()
             else:
-                self.stop_sun_monitor()
+                self.trigger_auto_measurement(None, None, None, datetime.now(), config=config)
+
+        def set_sun_trigger_mode(self, checked):
+            if checked:
+                self.sun_status_label.setText("Sun trigger mode enabled; press Start Auto Scan to monitor")
+                self.log_msg("Sun trigger mode enabled")
+            else:
+                self.sun_status_label.setText("Sun trigger mode disabled; Start Auto Scan runs immediately")
+                self.log_msg("Sun trigger mode disabled")
 
         def sun_target_values(self):
             start = self.target_start_input.value()
@@ -1334,21 +1611,36 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             return [round(start + i * step, 3) for i in range(count + 1) if start + i * step <= end + 1e-9]
 
         def start_sun_monitor(self):
+            if self.auto_monitoring:
+                self.log_msg("Sun trigger monitor already running")
+                return
             self.completed_sun_targets = set()
+            self.queued_sun_trigger = None
+            self.last_sun_altitude = None
             interval_ms = int(self.check_interval_input.value() * 1000)
             self.auto_monitor_timer.setInterval(interval_ms)
             self.auto_monitor_timer.start()
             self.auto_monitoring = True
-            self.set_sun_trigger_switch(True)
+            self.auto_stop_requested = False
+            self.set_auto_scan_button_state("running")
             self.log_msg("Sun trigger monitor started")
             self.check_sun_trigger()
 
         def stop_sun_monitor(self):
             self.auto_monitor_timer.stop()
             self.auto_monitoring = False
-            self.set_sun_trigger_switch(False)
+            self.queued_sun_trigger = None
+            self.last_sun_altitude = None
             self.sun_status_label.setText("Sun trigger monitor stopped")
             self.log_msg("Sun trigger monitor stopped")
+
+        def sun_due_targets(self, pending, altitude, tolerance):
+            due = {target for target in pending if abs(altitude - target) <= tolerance}
+            if self.last_sun_altitude is not None:
+                low = min(self.last_sun_altitude, altitude)
+                high = max(self.last_sun_altitude, altitude)
+                due.update(target for target in pending if low <= target <= high)
+            return sorted(due)
 
         def check_sun_trigger(self):
             dt = datetime.now()
@@ -1369,13 +1661,38 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 status += ", all targets completed"
             if self.auto_job_running:
                 status += ", acquisition running"
+            if self.queued_sun_trigger is not None:
+                status += f", queued target={self.queued_sun_trigger['target_altitude']:.2f} deg"
             self.sun_status_label.setText(status)
 
-            if nearest is None or self.auto_job_running:
+            due_targets = self.sun_due_targets(pending, altitude, tolerance)
+            self.last_sun_altitude = altitude
+
+            if nearest is None:
                 return
-            if abs(altitude - nearest) <= tolerance:
-                self.completed_sun_targets.add(nearest)
-                self.trigger_auto_measurement(nearest, altitude, azimuth, dt)
+            if not due_targets:
+                return
+
+            trigger_target = min(due_targets, key=lambda target: abs(altitude - target))
+            self.completed_sun_targets.update(due_targets)
+            if self.auto_job_running:
+                self.queued_sun_trigger = {
+                    "target_altitude": trigger_target,
+                    "actual_altitude": altitude,
+                    "azimuth": azimuth,
+                    "dt": dt,
+                    "missed_count": max(0, len(due_targets) - 1),
+                }
+                message = (
+                    f"Sun target queued while scan is running: target={trigger_target:.2f}, "
+                    f"actual={altitude:.2f}, azimuth={azimuth:.2f}"
+                )
+                if len(due_targets) > 1:
+                    message += f", {len(due_targets) - 1} older target(s) marked handled"
+                self.log_msg(message)
+                return
+
+            self.trigger_auto_measurement(trigger_target, altitude, azimuth, dt)
 
         def trigger_auto_measurement(self, target_altitude, actual_altitude, azimuth, dt, config=None):
             if h5py is None:
@@ -1385,14 +1702,16 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 self.log_msg("Auto scan already running")
                 return
             self.auto_job_running = True
+            self.auto_stop_requested = False
             self.stop_acquisition_event.clear()
-            self.stop_acquisition_btn.setEnabled(True)
+            self.set_auto_scan_button_state("running")
             if config is None:
                 try:
                     config = self.auto_scan_config()
                 except Exception as exc:
                     self.auto_job_running = False
-                    self.stop_acquisition_btn.setEnabled(False)
+                    if not self.auto_monitoring:
+                        self.set_auto_scan_button_state("idle")
                     self.log_msg(f"Auto scan config invalid: {exc}")
                     return
             self.log_msg(
@@ -1407,11 +1726,20 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
         def stop_acquisition(self):
             if not self.auto_job_running:
-                self.log_msg("No acquisition is running")
+                if self.auto_monitoring:
+                    self.stop_sun_monitor()
+                    self.set_auto_scan_button_state("idle")
+                    self.log_msg("Auto scan stopped")
+                else:
+                    self.log_msg("No auto scan is running")
                 return
+            if self.auto_monitoring:
+                self.stop_sun_monitor()
+            self.queued_sun_trigger = None
+            self.auto_stop_requested = True
             self.stop_acquisition_event.set()
-            self.stop_acquisition_btn.setEnabled(False)
-            self.log_msg("Stop acquisition requested")
+            self.set_auto_scan_button_state("stopping")
+            self.log_msg("Stop auto scan requested; current scan group will finish first")
 
         def run_auto_scan_worker(self, config, target_altitude, actual_altitude, trigger_azimuth, trigger_dt):
             output_dir = config["output_dir"]
@@ -1424,7 +1752,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             filepath = os.path.join(datapath, filename)
 
             angles = config["angles"]
-            dtilts = np.arange(config["start_tilt"], config["end_tilt"] + 1e-9, config["step_tilt"])
+            _, initial_sun_altitude = solar_position_deg(datetime.now(), config["latitude"], config["longitude"])
+            end_tilt = int(88.0 - initial_sun_altitude)
+            if end_tilt <= config["start_tilt"]:
+                dtilts = np.array([], dtype=float)
+            else:
+                dtilts = np.arange(config["start_tilt"], end_tilt, config["step_tilt"], dtype=float)
             measstart = time.time()
             acquisitions_written = 0
             stopped = False
@@ -1440,19 +1773,19 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Trigger Actual Altitude [deg]"] = np.nan if actual_altitude is None else float(actual_altitude)
                 meas.attrs["Trigger Azimuth [deg]"] = np.nan if trigger_azimuth is None else float(trigger_azimuth)
                 meas.attrs["Trigger Timestamp"] = trigger_dt.isoformat(timespec="seconds")
+                meas.attrs["Scan Initial Sun Altitude [deg]"] = float(initial_sun_altitude)
+                meas.attrs["Scan Start Tilt Offset [deg]"] = float(config["start_tilt"])
+                meas.attrs["Scan Computed End Tilt Offset [deg]"] = float(end_tilt)
+                meas.attrs["Scan Step Tilt [deg]"] = float(config["step_tilt"])
                 meas.attrs["UV Image Width [px]"] = UV_IMAGE_WIDTH_PX
                 meas.attrs["UV Image Height [px]"] = UV_IMAGE_HEIGHT_PX
                 meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
                 meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
 
                 for aq_num, dtilt in enumerate(dtilts):
-                    if self.stop_acquisition_event.is_set():
-                        stopped = True
-                        break
-
                     dt = datetime.now()
                     sun_azimuth, sun_altitude = solar_position_deg(dt, config["latitude"], config["longitude"])
-                    pan = sun_azimuth
+                    pan = azimuth_to_moog_pan(sun_azimuth)
                     tilt = sun_altitude + float(dtilt)
                     requested_pan = pan - config["pan_offset"]
                     requested_tilt = tilt - config["tilt_offset"]
@@ -1465,20 +1798,17 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     uv_frames = []
                     capture_start = time.time()
                     for angle in angles:
-                        if self.stop_acquisition_event.is_set():
-                            stopped = True
-                            break
                         with self.motion_lock:
                             self.polarizer.move_absolute(angle)
                         time.sleep(0.05)
                         with self.camera_lock:
+                            self.update_sim_camera_site()
                             frame = self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
                             if config["auto_exposure"]:
                                 self.calculate_auto_exposure(frame, target_median=config["target_median"])
+                                self.update_sim_camera_site()
                                 frame = self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
                         uv_frames.append(np.asarray(frame, dtype=np.uint16))
-                    if stopped:
-                        break
                     uvmeastime = time.time() - capture_start
 
                     aq = h5.create_group(f"Aquistion_{aq_num}")
@@ -1504,6 +1834,23 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     uvimg.attrs["UV Image Shape"] = str(uv_stack.shape)
                     acquisitions_written += 1
 
+                    if aq_num == 0:
+                        preview_frames = [frame.copy() for frame in uv_frames[:4]]
+                        self.result_queue.put((
+                            "auto_preview",
+                            {
+                                "frames": preview_frames,
+                                "angles": list(angles[:len(preview_frames)]),
+                                "timestamp": dt.strftime("%H:%M:%S"),
+                                "sun_altitude": float(sun_altitude),
+                                "sun_zenith": float(90.0 - sun_altitude),
+                                "actual_pan": float(moog_status.pan_deg),
+                                "actual_tilt": float(moog_status.tilt_deg),
+                                "filepath": filepath,
+                            },
+                            None,
+                        ))
+
                     self.result_queue.put((
                         "auto_progress",
                         {
@@ -1516,6 +1863,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         None,
                     ))
 
+                if self.stop_acquisition_event.is_set():
+                    stopped = True
                 meas.attrs["Total Measurement Time"] = (time.time() - measstart) / 60.0
                 meas.attrs["Acquisition Stopped"] = int(stopped)
                 meas.attrs["Completed Acquisitions"] = acquisitions_written
@@ -1556,7 +1905,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 if error is not None:
                     if kind == "auto_trigger":
                         self.auto_job_running = False
-                        self.stop_acquisition_btn.setEnabled(False)
+                        self.auto_stop_requested = False
+                        self.set_auto_scan_button_state("running" if self.auto_monitoring else "idle")
                     elif kind == "moog_open":
                         self.set_moog_home_enabled(False)
                         self.set_switch_pair("moog_switch", False)
@@ -1650,6 +2000,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.last_center_result = result
                     if result.get("ok"):
                         self.pan_offset = float(result["pan_offset_deg"])
+                        self.save_auto_scan_settings()
                     self.update_auto_calibration_labels()
                     if result.get("ok"):
                         self.apply_status()
@@ -1667,12 +2018,17 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         self.apply_status()
                 elif kind == "stop":
                     self.set_moog_home_enabled(False)
+                    self.auto_job_running = False
+                    self.auto_stop_requested = False
+                    self.set_auto_scan_button_state("idle")
                     self.log_msg(result)
                     self.apply_status()
                 elif kind == "auto_trigger":
                     self.auto_job_running = False
-                    self.stop_acquisition_btn.setEnabled(False)
                     if result.get("stopped"):
+                        self.queued_sun_trigger = None
+                        self.auto_stop_requested = False
+                        self.set_auto_scan_button_state("idle")
                         self.log_msg(
                             "Auto scan stopped: "
                             f"{result['acquisitions']}/{result['planned_acquisitions']} acquisitions saved to {result['filepath']}"
@@ -1682,6 +2038,24 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             "Auto scan complete: "
                             f"{result['acquisitions']} acquisitions saved to {result['filepath']}"
                         )
+                        queued_trigger = self.queued_sun_trigger
+                        self.queued_sun_trigger = None
+                        if self.auto_monitoring and queued_trigger is not None:
+                            self.log_msg(
+                                "Starting queued sun-trigger scan: "
+                                f"target={queued_trigger['target_altitude']:.2f}, "
+                                f"actual={queued_trigger['actual_altitude']:.2f}, "
+                                f"azimuth={queued_trigger['azimuth']:.2f}"
+                            )
+                            self.trigger_auto_measurement(
+                                queued_trigger["target_altitude"],
+                                queued_trigger["actual_altitude"],
+                                queued_trigger["azimuth"],
+                                queued_trigger["dt"],
+                            )
+                        else:
+                            self.auto_stop_requested = False
+                            self.set_auto_scan_button_state("running" if self.auto_monitoring else "idle")
                 elif kind == "auto_progress":
                     self.current_status = result["status"]
                     self.apply_status()
@@ -1689,6 +2063,29 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         f"Auto scan acquisition {result['aq_num'] + 1}/{result['total']}, "
                         f"dtilt={result['dtilt']:.2f}, file={result['filepath']}"
                     )
+                elif kind == "auto_preview":
+                    frames = result.get("frames", [])
+                    angles = result.get("angles", [])
+                    timestamp = result.get("timestamp", "")
+                    sun_altitude = result.get("sun_altitude", float("nan"))
+                    sun_zenith = result.get("sun_zenith", 90.0 - sun_altitude)
+                    actual_pan = result.get("actual_pan", float("nan"))
+                    actual_tilt = result.get("actual_tilt", float("nan"))
+                    for idx, label in enumerate(self.auto_preview_labels):
+                        if idx < len(frames):
+                            angle_text = f"{angles[idx]:g} deg" if idx < len(angles) else f"Image {idx + 1}"
+                            label.set_frame(
+                                frames[idx],
+                                (
+                                    f"Pol {angle_text}\n"
+                                    f"{timestamp}, sun zen={sun_zenith:.2f} deg\n"
+                                    f"sun alt={sun_altitude:.2f} deg\n"
+                                    f"actual pan={actual_pan:.2f}, tilt={actual_tilt:.2f}"
+                                ),
+                            )
+                        else:
+                            label.clear_frame()
+                    self.log_msg(f"Updated acquisition 0 preview: {len(frames)} image(s)")
 
         def set_simulation(self, checked):
             for checkbox_name in ("sim_check", "auto_sim_check"):
@@ -1704,8 +2101,17 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.moog = SimMoogController() if checked else RealMoogController()
             self.polarizer = SimPolarizerController() if checked else RealPolarizerController()
             self.camera = SimCameraController() if checked else RealVmbCameraController()
+            if isinstance(self.camera, SimCameraController):
+                self.update_sim_camera_site()
             self.current_status = self.moog.get_status()
-            self.log_msg("Simulation mode enabled" if checked else "Hardware mode enabled")
+            if checked:
+                self.log_msg(
+                    "Simulation mode enabled: "
+                    "pan=0 points south, "
+                    f"sim pan mount offset={self.camera.pan_mount_offset_deg:+.2f} deg"
+                )
+            else:
+                self.log_msg("Hardware mode enabled")
             self.apply_status()
 
         def refresh_ports(self):
@@ -1883,7 +2289,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
         def stop_all(self):
             self.stop_acquisition_event.set()
-            self.stop_acquisition_btn.setEnabled(False)
+            self.auto_stop_requested = True
+            self.set_auto_scan_button_state("stopping")
             if self.auto_monitoring:
                 self.stop_sun_monitor()
             self.timer.stop()
@@ -1953,10 +2360,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             def task():
                 with self.camera_lock:
+                    self.update_sim_camera_site()
                     frame = self.camera.get_frame(pan_deg, tilt_deg)
                     exposure_info = None
                     if auto_exposure:
                         exposure_info = self.calculate_auto_exposure(frame)
+                        self.update_sim_camera_site()
                         frame = self.camera.get_frame(pan_deg, tilt_deg)
                 center, _ = detect_sun_center(frame)
                 return frame, center, exposure_info
@@ -2015,18 +2424,19 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             self.clear_center_result_for_reposition()
             dt = datetime.now()
-            sun_pan, sun_tilt = solar_position_deg(
+            sun_azimuth, sun_tilt = solar_position_deg(
                 dt,
                 self.latitude_input.value(),
                 self.longitude_input.value(),
             )
+            sun_pan = azimuth_to_moog_pan(sun_azimuth)
             target_pan, target_tilt = moog_command_pointing(
                 sun_pan - self.pan_offset,
                 sun_tilt - self.tilt_offset,
             )
             self.log_msg(
                 "Aiming at calculated sun: "
-                f"sun pan={sun_pan:.2f}, sun tilt={sun_tilt:.2f}, "
+                f"sun az={sun_azimuth:.2f}, sun pan={sun_pan:.2f}, sun tilt={sun_tilt:.2f}, "
                 f"using pan_offset={self.pan_offset:.2f}, "
                 f"target Moog pan={target_pan:.2f}, tilt={target_tilt:.2f}"
             )
@@ -2136,6 +2546,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     initial_pan_deg = float(status.pan_deg)
                     initial_tilt_deg = float(status.tilt_deg)
                 with self.camera_lock:
+                    self.update_sim_camera_site()
                     local_frame = self.camera.get_frame(initial_pan_deg, initial_tilt_deg)
 
                 center, info = detect_sun_center(local_frame)
@@ -2170,6 +2581,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 probe_info = {}
                 try:
                     with self.camera_lock:
+                        self.update_sim_camera_site()
                         probe_frame = self.camera.get_frame(probe_status.pan_deg, probe_status.tilt_deg)
                     probe_center, probe_info = detect_sun_center(probe_frame)
                 finally:
@@ -2198,9 +2610,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     )
                     self.current_status = centered_status
                 centered_dt = datetime.now()
-                sun_pan, sun_tilt = solar_position_deg(centered_dt, latitude, longitude)
+                sun_azimuth, sun_tilt = solar_position_deg(centered_dt, latitude, longitude)
+                sun_pan = azimuth_to_moog_pan(sun_azimuth)
                 pan_offset = quantize_pointing(sun_pan - centered_status.pan_deg)
                 with self.camera_lock:
+                    self.update_sim_camera_site()
                     centered_frame = self.camera.get_frame(centered_status.pan_deg, centered_status.tilt_deg)
                 centered_center, _ = detect_sun_center(centered_frame)
                 self.result_queue.put(("frame", (centered_frame, centered_center, None), None))
@@ -2217,6 +2631,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     "pan_pixels_per_degree": pan_pixels_per_degree,
                     "centered_pan_deg": centered_status.pan_deg,
                     "centered_tilt_deg": centered_status.tilt_deg,
+                    "sun_azimuth_deg": sun_azimuth,
                     "sun_pan_deg": sun_pan,
                     "sun_tilt_deg": sun_tilt,
                     "pan_offset_deg": pan_offset,
