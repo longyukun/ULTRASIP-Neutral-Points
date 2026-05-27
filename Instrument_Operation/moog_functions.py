@@ -69,6 +69,8 @@ GEN_CCWM = 2  # Moving counter-clockwise
 GEN_UPM = 1   # Moving up
 GEN_DWNM = 0  # Moving down
 
+MOOG_SETTLED_POSITION_TOLERANCE_DEG = 0.25
+
 class LimitAxis(IntEnum):
     CW = 0
     CCW = 1
@@ -175,6 +177,28 @@ def is_move_complete(status):
     return int(not moving)
 
 
+def moog_faults(status):
+    flags = (
+        ('pan clockwise soft limit', status.pan_status.cw_soft_lim),
+        ('pan counter-clockwise soft limit', status.pan_status.ccw_soft_lim),
+        ('pan clockwise hard limit', status.pan_status.cw_hard_lim),
+        ('pan counter-clockwise hard limit', status.pan_status.ccw_hard_lim),
+        ('pan timeout', status.pan_status.timeout),
+        ('pan direction error', status.pan_status.direction_err),
+        ('pan current overload', status.pan_status.current_overload),
+        ('pan resolver fault', status.pan_status.resolver_fault),
+        ('tilt up soft limit', status.tilt_status.up_soft_lim),
+        ('tilt down soft limit', status.tilt_status.down_soft_lim),
+        ('tilt up hard limit', status.tilt_status.up_hard_lim),
+        ('tilt down hard limit', status.tilt_status.down_hard_lim),
+        ('tilt timeout', status.tilt_status.timeout),
+        ('tilt direction error', status.tilt_status.direction_err),
+        ('tilt current overload', status.tilt_status.current_overload),
+        ('tilt resolver fault', status.tilt_status.resolver_fault),
+    )
+    return [name for name, active in flags if active]
+
+
 def write_moog_status_attrs(attrs, status, target_pan_deg, target_tilt_deg):
     attrs['Moog Target Pan [deg]'] = float(target_pan_deg)
     attrs['Moog Target Tilt [deg]'] = float(target_tilt_deg)
@@ -185,6 +209,8 @@ def write_moog_status_attrs(attrs, status, target_pan_deg, target_tilt_deg):
     attrs['Moog Move Complete'] = is_move_complete(status)
     attrs['Moog Status Raw Bytes'] = status.raw_bytes
     attrs['Moog EXEC Bit'] = int(status.gen_status.executing)
+    attrs['Moog Override Soft Limit Return Bit'] = int(status.gen_status.override_return)
+    attrs['Moog Faults'] = json.dumps(moog_faults(status))
     attrs['Moog Moving Bits'] = json.dumps({
         'cw': int(status.gen_status.moving_cw),
         'ccw': int(status.gen_status.moving_ccw),
@@ -290,7 +316,7 @@ def send_request(serial_port, buffer: list, get_rsp=True) -> list:
 
 def get_status_jog(serial_port,
                    get_response=True,
-                   ru=0, osl=1, stop=0, res=0,
+                   ru=0, osl=0, stop=0, res=0,
                    pan_speed=0, pan_dir=0,
                    tilt_speed=0, tilt_dir=0,
                    zoom_speed=0, zoom_dir=0,
@@ -338,7 +364,7 @@ def get_status_jog(serial_port,
     
 def keep_alive(serial_port,
                    get_response=True,
-                   ru=0, osl=1, stop=0, res=0,
+                   ru=0, osl=0, stop=0, res=0,
                    pan_speed=0, pan_dir=0,
                    tilt_speed=0, tilt_dir=0,
                    zoom_speed=0, zoom_dir=0,
@@ -426,9 +452,10 @@ def mv_to_coord(serial_port,pan,tilt, get_response=True):
     # print(formatted_resp)
 
 def move_to_coord_and_wait(serial_port, pan, tilt, timeout=30.0,
-                           poll_interval=0.1, position_tolerance=0.15,
+                           poll_interval=0.1,
+                           position_tolerance=MOOG_SETTLED_POSITION_TOLERANCE_DEG,
                            verbose=True):
-    """Move to a commanded coordinate and return only its settled status."""
+    """Move to a commanded coordinate and accept the controller's settled tolerance."""
     target_pan = float(pan) / 10.0
     target_tilt = float(tilt) / 10.0
     deadline = time.time() + float(timeout)
@@ -436,12 +463,21 @@ def move_to_coord_and_wait(serial_port, pan, tilt, timeout=30.0,
 
     mv_to_coord(serial_port, pan, tilt)
     while time.time() < deadline:
-        last_status = get_status_jog(serial_port, verbose=verbose)
+        last_status = get_status_jog(serial_port, osl=0, verbose=verbose)
         target_reached = (
             abs(last_status.pan_coord - target_pan) <= position_tolerance
             and abs(last_status.tilt_coord - target_tilt) <= position_tolerance
         )
-        if is_move_complete(last_status) and target_reached:
+        faults = moog_faults(last_status)
+        move_complete = is_move_complete(last_status)
+        if move_complete and not target_reached and faults:
+            raise RuntimeError(
+                "Moog stopped before reaching target "
+                f"pan={target_pan:.1f}, tilt={target_tilt:.1f}; "
+                f"last actual pan={last_status.pan_coord:.1f}, tilt={last_status.tilt_coord:.1f}; "
+                f"faults={', '.join(faults)}."
+            )
+        if move_complete and target_reached:
             return last_status
         time.sleep(poll_interval)
 
@@ -450,7 +486,13 @@ def move_to_coord_and_wait(serial_port, pan, tilt, timeout=30.0,
     raise TimeoutError(
         "Moog failed to settle at target "
         f"pan={target_pan:.1f}, tilt={target_tilt:.1f}; "
-        f"last actual pan={last_status.pan_coord:.1f}, tilt={last_status.tilt_coord:.1f}."
+        f"last actual pan={last_status.pan_coord:.1f}, tilt={last_status.tilt_coord:.1f}; "
+        f"override_soft_limit={last_status.gen_status.override_return}, "
+        "soft_limits="
+        f"(pan_cw={last_status.pan_status.cw_soft_lim}, "
+        f"pan_ccw={last_status.pan_status.ccw_soft_lim}, "
+        f"tilt_up={last_status.tilt_status.up_soft_lim}, "
+        f"tilt_down={last_status.tilt_status.down_soft_lim})."
     )
 
 def mv_to_abszero(serial_port,get_response=True):

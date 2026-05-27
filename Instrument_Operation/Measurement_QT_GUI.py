@@ -789,7 +789,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.result_queue = queue.Queue()
             self.camera_pending = False
             self.status_pending = False
-            self.goto_inputs_dirty = False
             self.current_status = self.moog.get_status()
 
             self.timer = QtCore.QTimer(self)
@@ -1095,25 +1094,16 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             status_layout.addWidget(self.pan_display)
             status_layout.addWidget(self.tilt_display)
 
-            goto_layout = QtWidgets.QHBoxLayout()
-            self.pan_input = QtWidgets.QDoubleSpinBox()
-            self.pan_input.setRange(PAN_MIN_DEG, PAN_MAX_DEG)
-            self.pan_input.setDecimals(2)
-            self.pan_input.setSingleStep(MOOG_RESOLUTION_DEG)
-            self.pan_input.valueChanged.connect(self.mark_goto_inputs_dirty)
-            self.pan_input.lineEdit().textEdited.connect(self.mark_goto_inputs_dirty)
-            self.tilt_input = QtWidgets.QDoubleSpinBox()
-            self.tilt_input.setRange(TILT_MIN_DEG, TILT_MAX_DEG)
-            self.tilt_input.setDecimals(2)
-            self.tilt_input.setSingleStep(MOOG_RESOLUTION_DEG)
-            self.tilt_input.valueChanged.connect(self.mark_goto_inputs_dirty)
-            self.tilt_input.lineEdit().textEdited.connect(self.mark_goto_inputs_dirty)
-            goto_btn = QtWidgets.QPushButton("Go to")
-            goto_btn.clicked.connect(self.goto_inputs)
-            goto_layout.addWidget(self.pan_input)
-            goto_layout.addWidget(self.tilt_input)
-            goto_layout.addWidget(goto_btn)
-            controls_layout.addLayout(goto_layout)
+            pan_offset_layout = QtWidgets.QHBoxLayout()
+            self.pan_offset_input = QtWidgets.QDoubleSpinBox()
+            self.pan_offset_input.setRange(PAN_MIN_DEG, PAN_MAX_DEG)
+            self.pan_offset_input.setDecimals(2)
+            self.pan_offset_input.setSingleStep(MOOG_RESOLUTION_DEG)
+            self.pan_offset_input.setValue(self.pan_offset)
+            self.pan_offset_input.valueChanged.connect(self.set_calibration_pan_offset)
+            pan_offset_layout.addWidget(QtWidgets.QLabel("Pan Offset [deg]"))
+            pan_offset_layout.addWidget(self.pan_offset_input)
+            controls_layout.addLayout(pan_offset_layout)
 
             polarizer_group = QtWidgets.QGroupBox("Polarizer")
             polarizer_layout = QtWidgets.QHBoxLayout(polarizer_group)
@@ -1253,25 +1243,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.log_msg("Calibration page opened")
 
         def finish_calibration(self):
-            if self.last_center_result and self.last_center_result.get("ok"):
-                centered_pan = float(self.last_center_result["centered_pan_deg"])
-                sun_pan = float(self.last_center_result["sun_pan_deg"])
-            else:
-                centered_pan = float(self.current_status.pan_deg)
-                sun_pan, _ = solar_position_deg(
-                    datetime.now(),
-                    self.latitude_input.value(),
-                    self.longitude_input.value(),
-                )
-
-            self.pan_offset = quantize_pointing(sun_pan - centered_pan)
+            self.pan_offset = quantize_pointing(self.pan_offset_input.value())
             self.tilt_offset = 0.0
             self.calibration_complete = True
             self.update_auto_calibration_labels()
             self.pages.setCurrentIndex(0)
             self.log_msg(
                 "Calibration complete: "
-                f"sun pan={sun_pan:.2f}, centered Moog pan={centered_pan:.2f}, "
                 f"pan_offset={self.pan_offset:.2f}, tilt_offset={self.tilt_offset:.2f}"
             )
 
@@ -1282,6 +1260,16 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.auto_tilt_offset_label.setText(f"{self.tilt_offset:.2f}")
             centered = self.last_center_result.get("centered_pan_deg") if self.last_center_result else None
             self.auto_centered_pan_label.setText("none" if centered is None else f"{float(centered):.2f}")
+            pan_offset_input = getattr(self, "pan_offset_input", None)
+            if pan_offset_input is not None and pan_offset_input.value() != self.pan_offset:
+                pan_offset_input.blockSignals(True)
+                pan_offset_input.setValue(self.pan_offset)
+                pan_offset_input.blockSignals(False)
+
+        def set_calibration_pan_offset(self, value):
+            self.pan_offset = quantize_pointing(value)
+            self.update_auto_calibration_labels()
+            self.log_msg(f"Pan offset set to {self.pan_offset:.2f} deg")
 
         def browse_output_dir(self):
             path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Auto Scan Output Folder", self.output_dir_input.text())
@@ -1604,12 +1592,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.current_status = status
                     self.log_msg(message)
                     self.apply_status()
-                elif kind == "goto":
-                    message, status = result
-                    self.current_status = status
-                    self.goto_inputs_dirty = False
-                    self.log_msg(message)
-                    self.apply_status()
                 elif kind == "status":
                     self.current_status = result
                     self.log_msg(
@@ -1666,6 +1648,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.apply_status()
                 elif kind == "center":
                     self.last_center_result = result
+                    if result.get("ok"):
+                        self.pan_offset = float(result["pan_offset_deg"])
                     self.update_auto_calibration_labels()
                     if result.get("ok"):
                         self.apply_status()
@@ -1983,13 +1967,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             status = self.current_status
             self.pan_display.set_value(status.pan_deg)
             self.tilt_display.set_value(status.tilt_deg)
-            if not self.goto_inputs_dirty:
-                self.pan_input.blockSignals(True)
-                self.tilt_input.blockSignals(True)
-                self.pan_input.setValue(status.pan_deg)
-                self.tilt_input.setValue(status.tilt_deg)
-                self.pan_input.blockSignals(False)
-                self.tilt_input.blockSignals(False)
             center_line = "Sun center: none"
             if self.last_center_result:
                 if self.last_center_result.get("ok"):
@@ -2024,22 +2001,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 return f"Moved pan {dpan:+.2f}, tilt {dtilt:+.2f}", status
 
             self.submit_worker("motion", task)
-
-        def mark_goto_inputs_dirty(self, _value=None):
-            self.goto_inputs_dirty = True
-
-        def goto_inputs(self):
-            self.clear_center_result_for_reposition()
-            pan = self.pan_input.value()
-            tilt = self.tilt_input.value()
-
-            def task():
-                with self.motion_lock:
-                    status = self.moog.move_absolute(pan, tilt)
-                    self.current_status = status
-                return f"Moved to pan={pan:.2f}, tilt={tilt:.2f}", status
-
-            self.submit_worker("goto", task)
 
         def clear_center_result_for_reposition(self):
             if self.last_center_result and self.last_center_result.get("ok"):
@@ -2302,12 +2263,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     cal = h5.create_group("Pointing_Calibration")
                     cal.attrs["Pan [deg]"] = float(status.pan_deg)
                     cal.attrs["Tilt [deg]"] = float(status.tilt_deg)
+                    cal.attrs["Pan Offset [deg]"] = float(self.pan_offset)
                     if self.last_center_result and self.last_center_result.get("ok"):
                         cal.attrs["Sun Centered Pan [deg]"] = float(self.last_center_result["centered_pan_deg"])
                         cal.attrs["Sun Centered Tilt [deg]"] = float(self.last_center_result["centered_tilt_deg"])
                         cal.attrs["Calculated Sun Pan [deg]"] = float(self.last_center_result["sun_pan_deg"])
                         cal.attrs["Calculated Sun Tilt [deg]"] = float(self.last_center_result["sun_tilt_deg"])
-                        cal.attrs["Pan Offset [deg]"] = float(self.last_center_result["pan_offset_deg"])
+                        cal.attrs["Measured Pan Offset [deg]"] = float(self.last_center_result["pan_offset_deg"])
                     cal.attrs["Polarizer Angle [deg]"] = float(getattr(self.polarizer, "angle_deg", 0.0))
                     cal.attrs["Camera Exposure [us]"] = float(self.camera.get_exposure())
                     cal.attrs["Auto Exposure Enabled"] = int(self.auto_exposure_check.isChecked())
