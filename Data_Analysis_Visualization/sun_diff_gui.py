@@ -27,6 +27,7 @@ import circle_fit_sun_center as cfit
 
 
 DEFAULT_LOG = Path(__file__).with_name("sun_center_diff_log.csv")
+FOV_CENTER_Y = cfit.IMG_Y / 2.0
 
 
 def sun_candidate_label(fit):
@@ -47,6 +48,12 @@ def get_moog_label_values(aq):
         "actual_pan": float(aq.attrs.get("Moog Actual Pan [deg]", np.nan)),
         "actual_tilt": float(aq.attrs.get("Moog Actual Tilt [deg]", np.nan)),
     }
+
+
+def center_zenith_from_sun_pixel(aq, fit, fov_center_y=FOV_CENTER_Y):
+    sun_zenith = 90.0 - float(aq.attrs.get("Sun Position Altitude", np.nan))
+    row_offset = (fit["y"] - fov_center_y) * cfit.VFOV
+    return sun_zenith - row_offset
 
 
 def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0):
@@ -79,6 +86,10 @@ def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0)
         sun_alt_term = aq1_sun_alt - aq0_sun_alt
         z0 = 90.0 - aq0_tilt
         z1 = z0 + pixel_term + tilt_term + sun_alt_term
+        aq0_center_zen_from_sun = center_zenith_from_sun_pixel(aq0, fit0)
+        aq1_center_zen_from_sun = center_zenith_from_sun_pixel(aq1, fit1)
+        center_zen_diff_from_sun = aq1_center_zen_from_sun - aq0_center_zen_from_sun
+        moog_center_zen_diff = (90.0 - aq1_tilt) - (90.0 - aq0_tilt)
 
         display0 = cfit.downsample_intensity(aq0)
         display1 = cfit.downsample_intensity(aq1)
@@ -100,6 +111,11 @@ def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0)
             "zenith0": z0,
             "zenith1": z1,
             "diff": z1 - z0,
+            "fov_center_y": FOV_CENTER_Y,
+            "aq0_center_zen_from_sun": aq0_center_zen_from_sun,
+            "aq1_center_zen_from_sun": aq1_center_zen_from_sun,
+            "center_zen_diff_from_sun": center_zen_diff_from_sun,
+            "moog_center_zen_diff": moog_center_zen_diff,
             "pixel_term": pixel_term,
             "tilt_term": tilt_term,
             "tilt_source": tilt_source,
@@ -297,10 +313,14 @@ class SunDiffGui:
         self.status.set(
             f"{result['file']} | mode={result['mode']} | aq0 radius scale={result['aq0_radius_scale']:.2f} | "
             f"aq1 radius scale={result['aq1_radius_scale']:.2f} | "
-            f"total geometry diff={result['diff']:.6f} deg\n"
+            f"sun residual diff={result['diff']:.6f} deg\n"
             f"components: pixel-only={(result['pixel_term']):.6f} deg, "
             f"tilt={result['tilt_term']:.6f} deg ({result['tilt_source']}), "
             f"sun-alt={result['sun_alt_term']:.6f} deg\n"
+            f"FOV center zen from sun: aq0={result['aq0_center_zen_from_sun']:.6f}, "
+            f"aq1={result['aq1_center_zen_from_sun']:.6f}, "
+            f"diff={result['center_zen_diff_from_sun']:.6f} deg | "
+            f"Moog center zen diff={result['moog_center_zen_diff']:.6f} deg\n"
             f"aq0 pixel=({f0['x']:.1f}, {f0['y']:.1f}), zenith={result['zenith0']:.6f}, "
             f"r={f0['radius']:.1f}, rmse={f0['rmse']:.1f}, method={f0.get('fit_method', '')}, "
             f"sun_candidate={result['aq0_ok']}\n"
@@ -370,6 +390,11 @@ class SunDiffGui:
             "aq0_radius_scale",
             "aq1_radius_scale",
             "diff_deg",
+            "center_zenith_diff_from_sun_deg",
+            "moog_center_zenith_diff_deg",
+            "aq0_center_zenith_from_sun_deg",
+            "aq1_center_zenith_from_sun_deg",
+            "fov_center_y_px",
             "pixel_only_diff_deg",
             "tilt_term_deg",
             "tilt_source",
@@ -404,6 +429,11 @@ class SunDiffGui:
             "aq0_radius_scale": f"{r['aq0_radius_scale']:.6f}",
             "aq1_radius_scale": f"{r['aq1_radius_scale']:.6f}",
             "diff_deg": f"{r['diff']:.9f}",
+            "center_zenith_diff_from_sun_deg": f"{r['center_zen_diff_from_sun']:.9f}",
+            "moog_center_zenith_diff_deg": f"{r['moog_center_zen_diff']:.9f}",
+            "aq0_center_zenith_from_sun_deg": f"{r['aq0_center_zen_from_sun']:.9f}",
+            "aq1_center_zenith_from_sun_deg": f"{r['aq1_center_zen_from_sun']:.9f}",
+            "fov_center_y_px": f"{r['fov_center_y']:.3f}",
             "pixel_only_diff_deg": f"{r['pixel_term']:.9f}",
             "tilt_term_deg": f"{r['tilt_term']:.9f}",
             "tilt_source": r["tilt_source"],
