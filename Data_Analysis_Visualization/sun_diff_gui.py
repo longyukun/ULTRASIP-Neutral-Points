@@ -33,6 +33,22 @@ def sun_candidate_label(fit):
     return bool(fit and fit.get("sun_disk_candidate", False))
 
 
+def get_tilt_pair(aq0, aq1):
+    actual_key = "Moog Actual Tilt [deg]"
+    if actual_key in aq0.attrs and actual_key in aq1.attrs:
+        return float(aq0.attrs[actual_key]), float(aq1.attrs[actual_key]), actual_key
+    return float(aq0.attrs.get("Tilt", np.nan)), float(aq1.attrs.get("Tilt", np.nan)), "Tilt"
+
+
+def get_moog_label_values(aq):
+    return {
+        "requested_pan": float(aq.attrs.get("Moog Requested Pan [deg]", np.nan)),
+        "requested_tilt": float(aq.attrs.get("Moog Requested Tilt [deg]", np.nan)),
+        "actual_pan": float(aq.attrs.get("Moog Actual Pan [deg]", np.nan)),
+        "actual_tilt": float(aq.attrs.get("Moog Actual Tilt [deg]", np.nan)),
+    }
+
+
 def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0):
     cfit.INTENSITY_MODE = intensity_mode
     h5 = h5py.File(path, "r")
@@ -55,16 +71,14 @@ def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0)
         completed_fit1 = cfit.fit_completed_disk_centroid_from_arc(aq1, completed_radius, initial_fit=fit1_free)
         fit1 = completed_fit1 if completed_fit1 is not None else fit1_free
 
-        sza0_altitude = float(aq0.attrs["Sun Position Altitude"])
-        z0 = cfit.level1_zenith_at_y(aq0, fit0["y"], fit0["y"], sza0_altitude)
-        z1 = cfit.level1_zenith_at_y(aq1, fit1["y"], fit0["y"], sza0_altitude)
-        aq0_tilt = float(aq0.attrs.get("Tilt", np.nan))
-        aq1_tilt = float(aq1.attrs.get("Tilt", np.nan))
+        aq0_tilt, aq1_tilt, tilt_source = get_tilt_pair(aq0, aq1)
         aq0_sun_alt = float(aq0.attrs.get("Sun Position Altitude", np.nan))
         aq1_sun_alt = float(aq1.attrs.get("Sun Position Altitude", np.nan))
         pixel_term = (fit1["y"] - fit0["y"]) * cfit.VFOV
         tilt_term = aq0_tilt - aq1_tilt
         sun_alt_term = aq1_sun_alt - aq0_sun_alt
+        z0 = 90.0 - aq0_tilt
+        z1 = z0 + pixel_term + tilt_term + sun_alt_term
 
         display0 = cfit.downsample_intensity(aq0)
         display1 = cfit.downsample_intensity(aq1)
@@ -81,11 +95,14 @@ def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0)
             "fit1_completed": completed_fit1,
             "display0": display0,
             "display1": display1,
+            "aq0_moog": get_moog_label_values(aq0),
+            "aq1_moog": get_moog_label_values(aq1),
             "zenith0": z0,
             "zenith1": z1,
             "diff": z1 - z0,
             "pixel_term": pixel_term,
             "tilt_term": tilt_term,
+            "tilt_source": tilt_source,
             "sun_alt_term": sun_alt_term,
             "aq0_tilt": aq0_tilt,
             "aq1_tilt": aq1_tilt,
@@ -262,8 +279,15 @@ class SunDiffGui:
         self.root.after(100, self._poll_worker)
 
     def _plot_result(self, result):
-        self._plot_one(self.ax0, result["display0"], result["fit0"], "Aquisition_0")
-        self._plot_one(self.ax1, result["display1"], result["fit1"], "Aquisition_1", result["fit0"])
+        self._plot_one(self.ax0, result["display0"], result["fit0"], "Aquisition_0", moog_values=result["aq0_moog"])
+        self._plot_one(
+            self.ax1,
+            result["display1"],
+            result["fit1"],
+            "Aquisition_1",
+            result["fit0"],
+            moog_values=result["aq1_moog"],
+        )
         self.figure.suptitle(result["file"])
         self.figure.tight_layout()
         self.canvas.draw_idle()
@@ -275,7 +299,8 @@ class SunDiffGui:
             f"aq1 radius scale={result['aq1_radius_scale']:.2f} | "
             f"total geometry diff={result['diff']:.6f} deg\n"
             f"components: pixel-only={(result['pixel_term']):.6f} deg, "
-            f"tilt={result['tilt_term']:.6f} deg, sun-alt={result['sun_alt_term']:.6f} deg\n"
+            f"tilt={result['tilt_term']:.6f} deg ({result['tilt_source']}), "
+            f"sun-alt={result['sun_alt_term']:.6f} deg\n"
             f"aq0 pixel=({f0['x']:.1f}, {f0['y']:.1f}), zenith={result['zenith0']:.6f}, "
             f"r={f0['radius']:.1f}, rmse={f0['rmse']:.1f}, method={f0.get('fit_method', '')}, "
             f"sun_candidate={result['aq0_ok']}\n"
@@ -284,10 +309,19 @@ class SunDiffGui:
             f"sun_candidate={result['aq1_ok']}"
         )
 
-    def _plot_one(self, ax, display, fit, title, reference_fit=None):
+    def _format_plot_title(self, title, moog_values):
+        if moog_values is None:
+            return title
+        return (
+            f"{title}\n"
+            f"Req P/T=({moog_values['requested_pan']:.2f}, {moog_values['requested_tilt']:.2f}) "
+            f"Act P/T=({moog_values['actual_pan']:.2f}, {moog_values['actual_tilt']:.2f})"
+        )
+
+    def _plot_one(self, ax, display, fit, title, reference_fit=None, moog_values=None):
         ax.clear()
         ax.imshow(display, cmap="gray", origin="upper", interpolation="none")
-        ax.set_title(title)
+        ax.set_title(self._format_plot_title(title, moog_values))
         ax.set_xlabel(f"column / {cfit.DISPLAY_STEP}")
         ax.set_ylabel(f"row / {cfit.DISPLAY_STEP}")
 
@@ -338,6 +372,7 @@ class SunDiffGui:
             "diff_deg",
             "pixel_only_diff_deg",
             "tilt_term_deg",
+            "tilt_source",
             "sun_alt_term_deg",
             "aq0_zenith_deg",
             "aq1_zenith_deg",
@@ -371,6 +406,7 @@ class SunDiffGui:
             "diff_deg": f"{r['diff']:.9f}",
             "pixel_only_diff_deg": f"{r['pixel_term']:.9f}",
             "tilt_term_deg": f"{r['tilt_term']:.9f}",
+            "tilt_source": r["tilt_source"],
             "sun_alt_term_deg": f"{r['sun_alt_term']:.9f}",
             "aq0_zenith_deg": f"{r['zenith0']:.9f}",
             "aq1_zenith_deg": f"{r['zenith1']:.9f}",
