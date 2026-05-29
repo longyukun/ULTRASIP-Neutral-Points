@@ -38,15 +38,22 @@ def get_tilt_pair(aq0, aq1):
     actual_key = "Moog Actual Tilt [deg]"
     if actual_key in aq0.attrs and actual_key in aq1.attrs:
         return float(aq0.attrs[actual_key]), float(aq1.attrs[actual_key]), actual_key
+    requested_key = "Moog Requested Tilt [deg]"
+    if requested_key in aq0.attrs and requested_key in aq1.attrs:
+        return float(aq0.attrs[requested_key]), float(aq1.attrs[requested_key]), requested_key
     return float(aq0.attrs.get("Tilt", np.nan)), float(aq1.attrs.get("Tilt", np.nan)), "Tilt"
 
 
 def get_moog_label_values(aq):
+    has_requested = "Moog Requested Pan [deg]" in aq.attrs and "Moog Requested Tilt [deg]" in aq.attrs
+    has_actual = "Moog Actual Pan [deg]" in aq.attrs and "Moog Actual Tilt [deg]" in aq.attrs
     return {
-        "requested_pan": float(aq.attrs.get("Moog Requested Pan [deg]", np.nan)),
-        "requested_tilt": float(aq.attrs.get("Moog Requested Tilt [deg]", np.nan)),
+        "requested_pan": float(aq.attrs["Moog Requested Pan [deg]"] if has_requested else aq.attrs.get("Pan", np.nan)),
+        "requested_tilt": float(aq.attrs["Moog Requested Tilt [deg]"] if has_requested else aq.attrs.get("Tilt", np.nan)),
         "actual_pan": float(aq.attrs.get("Moog Actual Pan [deg]", np.nan)),
         "actual_tilt": float(aq.attrs.get("Moog Actual Tilt [deg]", np.nan)),
+        "has_requested": has_requested,
+        "has_actual": has_actual,
     }
 
 
@@ -89,7 +96,9 @@ def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0)
         aq0_center_zen_from_sun = center_zenith_from_sun_pixel(aq0, fit0)
         aq1_center_zen_from_sun = center_zenith_from_sun_pixel(aq1, fit1)
         center_zen_diff_from_sun = aq1_center_zen_from_sun - aq0_center_zen_from_sun
-        moog_center_zen_diff = (90.0 - aq1_tilt) - (90.0 - aq0_tilt)
+        aq0_center_zen_from_moog = 90.0 - aq0_tilt
+        aq1_center_zen_from_moog = 90.0 - aq1_tilt
+        center_zen_diff_from_moog = aq1_center_zen_from_moog - aq0_center_zen_from_moog
 
         display0 = cfit.downsample_intensity(aq0)
         display1 = cfit.downsample_intensity(aq1)
@@ -115,7 +124,9 @@ def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0)
             "aq0_center_zen_from_sun": aq0_center_zen_from_sun,
             "aq1_center_zen_from_sun": aq1_center_zen_from_sun,
             "center_zen_diff_from_sun": center_zen_diff_from_sun,
-            "moog_center_zen_diff": moog_center_zen_diff,
+            "aq0_center_zen_from_moog": aq0_center_zen_from_moog,
+            "aq1_center_zen_from_moog": aq1_center_zen_from_moog,
+            "center_zen_diff_from_moog": center_zen_diff_from_moog,
             "pixel_term": pixel_term,
             "tilt_term": tilt_term,
             "tilt_source": tilt_source,
@@ -319,8 +330,11 @@ class SunDiffGui:
             f"sun-alt={result['sun_alt_term']:.6f} deg\n"
             f"FOV center zen from sun: aq0={result['aq0_center_zen_from_sun']:.6f}, "
             f"aq1={result['aq1_center_zen_from_sun']:.6f}, "
-            f"diff={result['center_zen_diff_from_sun']:.6f} deg | "
-            f"Moog center zen diff={result['moog_center_zen_diff']:.6f} deg\n"
+            f"diff={result['center_zen_diff_from_sun']:.6f} deg\n"
+            f"FOV center zen from Moog ({result['tilt_source']}): "
+            f"aq0={result['aq0_center_zen_from_moog']:.6f}, "
+            f"aq1={result['aq1_center_zen_from_moog']:.6f}, "
+            f"diff={result['center_zen_diff_from_moog']:.6f} deg\n"
             f"aq0 pixel=({f0['x']:.1f}, {f0['y']:.1f}), zenith={result['zenith0']:.6f}, "
             f"r={f0['radius']:.1f}, rmse={f0['rmse']:.1f}, method={f0.get('fit_method', '')}, "
             f"sun_candidate={result['aq0_ok']}\n"
@@ -332,9 +346,12 @@ class SunDiffGui:
     def _format_plot_title(self, title, moog_values):
         if moog_values is None:
             return title
+        requested = f"Req P/T=({moog_values['requested_pan']:.2f}, {moog_values['requested_tilt']:.2f})"
+        if not moog_values.get("has_actual", False):
+            return f"{title}\n{requested}"
         return (
             f"{title}\n"
-            f"Req P/T=({moog_values['requested_pan']:.2f}, {moog_values['requested_tilt']:.2f}) "
+            f"{requested} "
             f"Act P/T=({moog_values['actual_pan']:.2f}, {moog_values['actual_tilt']:.2f})"
         )
 
@@ -391,7 +408,9 @@ class SunDiffGui:
             "aq1_radius_scale",
             "diff_deg",
             "center_zenith_diff_from_sun_deg",
-            "moog_center_zenith_diff_deg",
+            "center_zenith_diff_from_moog_deg",
+            "aq0_center_zenith_from_moog_deg",
+            "aq1_center_zenith_from_moog_deg",
             "aq0_center_zenith_from_sun_deg",
             "aq1_center_zenith_from_sun_deg",
             "fov_center_y_px",
@@ -430,7 +449,9 @@ class SunDiffGui:
             "aq1_radius_scale": f"{r['aq1_radius_scale']:.6f}",
             "diff_deg": f"{r['diff']:.9f}",
             "center_zenith_diff_from_sun_deg": f"{r['center_zen_diff_from_sun']:.9f}",
-            "moog_center_zenith_diff_deg": f"{r['moog_center_zen_diff']:.9f}",
+            "center_zenith_diff_from_moog_deg": f"{r['center_zen_diff_from_moog']:.9f}",
+            "aq0_center_zenith_from_moog_deg": f"{r['aq0_center_zen_from_moog']:.9f}",
+            "aq1_center_zenith_from_moog_deg": f"{r['aq1_center_zen_from_moog']:.9f}",
             "aq0_center_zenith_from_sun_deg": f"{r['aq0_center_zen_from_sun']:.9f}",
             "aq1_center_zenith_from_sun_deg": f"{r['aq1_center_zen_from_sun']:.9f}",
             "fov_center_y_px": f"{r['fov_center_y']:.3f}",
