@@ -227,25 +227,25 @@ class SunDiffGui:
         self.root.after(100, self._poll_worker)
 
     def _build_ui(self):
-        toolbar = ttk.Frame(self.root, padding=8)
+        toolbar = ttk.Frame(self.root, padding=4)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
         self.open_button = ttk.Button(toolbar, text="Open H5", command=self.open_file)
         self.open_button.pack(side=tk.LEFT)
 
-        ttk.Label(toolbar, text="Intensity").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Label(toolbar, text="Int").pack(side=tk.LEFT, padx=(6, 2))
         mode_menu = ttk.OptionMenu(toolbar, self.intensity_mode, self.intensity_mode.get(), "p0", "p0_p90")
         mode_menu.pack(side=tk.LEFT)
 
-        ttk.Label(toolbar, text="Left aq/group").pack(side=tk.LEFT, padx=(12, 4))
-        self.aq0_combo = ttk.Combobox(toolbar, textvariable=self.aq0_selector, width=24, state="readonly")
+        ttk.Label(toolbar, text="L").pack(side=tk.LEFT, padx=(6, 2))
+        self.aq0_combo = ttk.Combobox(toolbar, textvariable=self.aq0_selector, width=20, state="readonly")
         self.aq0_combo.pack(side=tk.LEFT)
 
-        ttk.Label(toolbar, text="Right aq/group").pack(side=tk.LEFT, padx=(8, 4))
-        self.aq1_combo = ttk.Combobox(toolbar, textvariable=self.aq1_selector, width=24, state="readonly")
+        ttk.Label(toolbar, text="R").pack(side=tk.LEFT, padx=(4, 2))
+        self.aq1_combo = ttk.Combobox(toolbar, textvariable=self.aq1_selector, width=20, state="readonly")
         self.aq1_combo.pack(side=tk.LEFT)
 
-        ttk.Label(toolbar, text="Left radius x").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Label(toolbar, text="Lr").pack(side=tk.LEFT, padx=(6, 2))
         self.aq0_radius_scale_label = ttk.Label(toolbar, text="1.00", width=4)
         self.aq0_radius_scale_label.pack(side=tk.LEFT)
         aq0_radius_scale = ttk.Scale(
@@ -255,11 +255,11 @@ class SunDiffGui:
             orient=tk.HORIZONTAL,
             variable=self.aq0_radius_scale,
             command=self.on_aq0_radius_scale_change,
-            length=120,
+            length=70,
         )
-        aq0_radius_scale.pack(side=tk.LEFT, padx=(4, 0))
+        aq0_radius_scale.pack(side=tk.LEFT, padx=(2, 0))
 
-        ttk.Label(toolbar, text="Right radius x").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Label(toolbar, text="Rr").pack(side=tk.LEFT, padx=(6, 2))
         self.radius_scale_label = ttk.Label(toolbar, text="1.00", width=4)
         self.radius_scale_label.pack(side=tk.LEFT)
         radius_scale = ttk.Scale(
@@ -269,36 +269,36 @@ class SunDiffGui:
             orient=tk.HORIZONTAL,
             variable=self.aq1_radius_scale,
             command=self.on_radius_scale_change,
-            length=160,
+            length=70,
         )
-        radius_scale.pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(toolbar, text="Refit", command=self.refit_current).pack(side=tk.LEFT, padx=(8, 0))
+        radius_scale.pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Button(toolbar, text="Refit", command=self.refit_current).pack(side=tk.LEFT, padx=(4, 0))
 
-        self.append_button = ttk.Button(toolbar, text="Append Diff To CSV", command=self.append_current, state=tk.DISABLED)
-        self.append_button.pack(side=tk.LEFT, padx=(12, 0))
+        self.append_button = ttk.Button(toolbar, text="Append", command=self.append_current, state=tk.DISABLED)
+        self.append_button.pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Button(toolbar, text="Choose CSV", command=self.choose_log).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(toolbar, text="CSV", command=self.choose_log).pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Label(toolbar, textvariable=self.log_path).pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
+        ttk.Label(toolbar, textvariable=self.log_path).pack(side=tk.LEFT, padx=(4, 0), fill=tk.X, expand=True)
 
-        self.drop_frame = ttk.Frame(self.root, padding=8)
+        self.drop_frame = ttk.Frame(self.root, padding=2)
         self.drop_frame.pack(side=tk.TOP, fill=tk.X)
         self.drop_label = ttk.Label(
             self.drop_frame,
             text="Drop H5 here" if DND_AVAILABLE else "Drag/drop needs tkinterdnd2; use Open H5 on this machine.",
             anchor="center",
             relief=tk.GROOVE,
-            padding=10,
+            padding=4,
         )
         self.drop_label.pack(fill=tk.X)
         if DND_AVAILABLE:
             self.drop_label.drop_target_register(DND_FILES)
             self.drop_label.dnd_bind("<<Drop>>", self.on_drop)
 
-        self.info = ttk.Label(self.root, textvariable=self.status, padding=(8, 0, 8, 8), justify=tk.LEFT)
+        self.info = ttk.Label(self.root, textvariable=self.status, padding=(4, 0, 4, 4), justify=tk.LEFT)
         self.info.pack(side=tk.TOP, fill=tk.X)
 
-        self.figure = Figure(figsize=(12, 5.8), dpi=100)
+        self.figure = Figure(figsize=(10, 4.4), dpi=100)
         self.ax0 = self.figure.add_subplot(1, 2, 1)
         self.ax1 = self.figure.add_subplot(1, 2, 2)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.root)
@@ -618,7 +618,8 @@ class SunDiffGui:
 
 def main():
     root = TkinterDnD.Tk() if DND_AVAILABLE else tk.Tk()
-    root.geometry("1300x820")
+    root.geometry("1000x700")
+    root.minsize(900, 640)
     app = SunDiffGui(root)
     root.mainloop()
 
