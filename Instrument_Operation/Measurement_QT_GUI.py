@@ -138,11 +138,11 @@ def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) 
 
 def azimuth_to_moog_pan(azimuth_deg: float) -> float:
     """Convert compass azimuth to Moog pan when pan=0 points south."""
-    return (float(azimuth_deg) % 360.0) - 180.0
+    return 180.0 - (float(azimuth_deg) % 360.0)
 
 
 def moog_pan_to_azimuth(pan_deg: float) -> float:
-    return (180.0 + float(pan_deg)) % 360.0
+    return (180.0 - float(pan_deg)) % 360.0
 
 
 def import_qt():
