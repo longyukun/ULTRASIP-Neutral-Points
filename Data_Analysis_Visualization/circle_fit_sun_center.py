@@ -29,8 +29,31 @@ def close_h5_quietly(h5):
 
 
 def read_frame_rows(raw, frame_index, row_start, row_stop):
+    if raw.ndim == 3:
+        if raw.shape[0] <= frame_index:
+            raise ValueError(f"UV Raw Images has {raw.shape[0]} frames; frame {frame_index} is unavailable")
+        if raw.shape[1] < row_stop or raw.shape[2] != IMG_X:
+            raise ValueError(f"Unsupported 3D UV Raw Images shape: {raw.shape}")
+        return raw[frame_index, row_start:row_stop, :].astype(np.float32)
+
+    if raw.ndim == 2:
+        if raw.shape[0] > frame_index and raw.shape[1] >= FRAME_SIZE:
+            start = row_start * IMG_X
+            stop = row_stop * IMG_X
+            return raw[frame_index, start:stop].reshape(row_stop - row_start, IMG_X).astype(np.float32)
+        if raw.shape[1] == IMG_X and raw.shape[0] >= (frame_index + 1) * IMG_Y:
+            start_row = frame_index * IMG_Y + row_start
+            stop_row = frame_index * IMG_Y + row_stop
+            return raw[start_row:stop_row, :].astype(np.float32)
+        raise ValueError(f"Unsupported 2D UV Raw Images shape: {raw.shape}")
+
+    if raw.ndim != 1:
+        raise ValueError(f"Unsupported UV Raw Images dimensions: {raw.ndim}")
+
     start = frame_index * FRAME_SIZE + row_start * IMG_X
     stop = frame_index * FRAME_SIZE + row_stop * IMG_X
+    if raw.shape[0] < stop:
+        raise ValueError(f"UV Raw Images has {raw.shape[0]} values; frame {frame_index} rows {row_start}:{row_stop} are unavailable")
     return raw[start:stop].reshape(row_stop - row_start, IMG_X).astype(np.float32)
 
 
