@@ -96,6 +96,23 @@ def infer_dtilt_from_name(name):
     return np.nan
 
 
+def list_acquisition_groups(path):
+    with h5py.File(path, "r") as h5:
+        groups = [
+            name
+            for name, item in h5.items()
+            if isinstance(item, h5py.Group) and "UV Image Data/UV Raw Images" in item
+        ]
+    return sorted(groups, key=acquisition_sort_key)
+
+
+def acquisition_sort_key(name):
+    dtilt = infer_dtilt_from_name(name)
+    if np.isfinite(dtilt):
+        return (0, dtilt, name)
+    return (1, name)
+
+
 def analyze_h5(
     path,
     intensity_mode,
@@ -195,6 +212,7 @@ class SunDiffGui:
         self.root = root
         self.root.title("ULTRASIP Sun Center Diff")
         self.result = None
+        self.current_path = None
         self.worker_queue = queue.Queue()
 
         self.intensity_mode = tk.StringVar(value="p0")
@@ -220,10 +238,12 @@ class SunDiffGui:
         mode_menu.pack(side=tk.LEFT)
 
         ttk.Label(toolbar, text="Left aq/group").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.Entry(toolbar, textvariable=self.aq0_selector, width=22).pack(side=tk.LEFT)
+        self.aq0_combo = ttk.Combobox(toolbar, textvariable=self.aq0_selector, width=24, state="readonly")
+        self.aq0_combo.pack(side=tk.LEFT)
 
         ttk.Label(toolbar, text="Right aq/group").pack(side=tk.LEFT, padx=(8, 4))
-        ttk.Entry(toolbar, textvariable=self.aq1_selector, width=22).pack(side=tk.LEFT)
+        self.aq1_combo = ttk.Combobox(toolbar, textvariable=self.aq1_selector, width=24, state="readonly")
+        self.aq1_combo.pack(side=tk.LEFT)
 
         ttk.Label(toolbar, text="Left radius x").pack(side=tk.LEFT, padx=(12, 4))
         self.aq0_radius_scale_label = ttk.Label(toolbar, text="1.00", width=4)
@@ -313,10 +333,35 @@ class SunDiffGui:
         if paths:
             self.load_file(paths[0])
 
+    def populate_acquisition_choices(self, path):
+        groups = list_acquisition_groups(path)
+        if len(groups) < 2:
+            raise ValueError("H5 must contain at least two acquisition groups with UV Raw Images")
+
+        self.aq0_combo["values"] = groups
+        self.aq1_combo["values"] = groups
+
+        left = resolve_acquisition_name(self.aq0_selector.get())
+        right = resolve_acquisition_name(self.aq1_selector.get())
+        if left not in groups:
+            left = "Aquistion_0" if "Aquistion_0" in groups else groups[0]
+        if right not in groups or right == left:
+            right = "Aquistion_1" if "Aquistion_1" in groups and "Aquistion_1" != left else groups[min(1, len(groups) - 1)]
+
+        self.aq0_selector.set(left)
+        self.aq1_selector.set(right)
+
     def load_file(self, path):
         self.result = None
         self.append_button.config(state=tk.DISABLED)
         self.open_button.config(state=tk.DISABLED)
+        self.current_path = path
+        try:
+            self.populate_acquisition_choices(path)
+        except Exception as exc:
+            self.open_button.config(state=tk.NORMAL)
+            self.status.set(f"Error: {exc}")
+            return
         self.status.set(f"Loading {path} ...")
         self._clear_axes()
 
