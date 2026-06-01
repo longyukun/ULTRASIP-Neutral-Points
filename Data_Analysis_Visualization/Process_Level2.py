@@ -15,6 +15,62 @@ from scipy.stats import norm
 import matplotlib.mlab as mlab
 import statsmodels.api as sm
 from scipy.optimize import curve_fit
+from scipy.ndimage import gaussian_filter, median_filter
+
+
+def estimate_smoothed_dolp_minimum(
+        dolp,
+        view_zen,
+        view_az,
+        zen_roi=None,
+        az_roi=None,
+        median_size=5,
+        gaussian_sigma=3,
+        low_percentile=1):
+    """
+    Estimate the DoLP minimum from a denoised low-DoLP region instead of a
+    single noisy minimum pixel.
+    """
+    valid = np.isfinite(dolp) & np.isfinite(view_zen) & np.isfinite(view_az)
+
+    if zen_roi is not None:
+        zen_min, zen_max = np.nanmin(zen_roi), np.nanmax(zen_roi)
+        valid &= (view_zen >= zen_min) & (view_zen <= zen_max)
+
+    if az_roi is not None:
+        az_min, az_max = np.nanmin(az_roi), np.nanmax(az_roi)
+        valid &= (view_az >= az_min) & (view_az <= az_max)
+
+    if not np.any(valid):
+        return None
+
+    fill_value = np.nanmedian(dolp[valid])
+    dolp_filled = np.where(valid, dolp, fill_value)
+    dolp_smoothed = gaussian_filter(
+        median_filter(dolp_filled, size=median_size),
+        sigma=gaussian_sigma)
+    dolp_smoothed = np.where(valid, dolp_smoothed, np.nan)
+
+    min_idx = np.unravel_index(np.nanargmin(dolp_smoothed), dolp_smoothed.shape)
+    threshold = np.nanpercentile(dolp_smoothed[valid], low_percentile)
+    low_mask = valid & (dolp_smoothed <= threshold)
+
+    if np.count_nonzero(low_mask) == 0:
+        low_mask[min_idx] = True
+
+    low_values = dolp_smoothed[low_mask]
+    weights = np.maximum(threshold - low_values, 0) + 1e-6
+    zen = np.average(view_zen[low_mask], weights=weights)
+    az = np.average(view_az[low_mask], weights=weights)
+
+    return {
+        'location': np.array([zen, az]),
+        'raw_min_location': np.array([view_zen[min_idx], view_az[min_idx]]),
+        'smoothed_min_dolp': dolp_smoothed[min_idx],
+        'low_percentile': low_percentile,
+        'low_pixel_count': np.count_nonzero(low_mask),
+        'smoothed_dolp': dolp_smoothed,
+    }
 
 #Load observations 
 #Set Date of Measurements 
@@ -374,8 +430,98 @@ for idx in range(i):
                 azimuth_error = results.bse[0]
                 az_slope = results.params[1]
                 azimuth = results.params[0]
-                
+
+                np_location = np.array([altitude, azimuth])
+                dolp_min = estimate_smoothed_dolp_minimum(
+                    dolp,
+                    view_zen,
+                    view_az,
+                    zen_roi=vza,
+                    az_roi=vaz)
+
                 print('Sun', saz, sza, 'NP', altitude, azimuth)
+                if dolp_min is None:
+                    dolp_min_location = np.array([np.nan, np.nan])
+                    dolp_min_delta = np.array([np.nan, np.nan])
+                    dolp_min_distance = np.nan
+                    print('DoLP minimum comparison skipped: no valid pixels in cropped ROI.')
+                else:
+                    dolp_min_location = dolp_min['location']
+                    dolp_min_delta = dolp_min_location - np_location
+                    dolp_min_distance = np.sqrt(np.sum(dolp_min_delta**2))
+                    print(
+                        'DoLP smoothed-min NP',
+                        dolp_min_location[0],
+                        dolp_min_location[1])
+                    print(
+                        'DoLP min - WLS NP [zen, az] deg',
+                        dolp_min_delta,
+                        'distance deg',
+                        dolp_min_distance)
+
+                    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                    extent = [
+                        view_az.min(),
+                        view_az.max(),
+                        view_zen.max(),
+                        view_zen.min()]
+
+                    im0 = axes[0].imshow(
+                        dolp,
+                        cmap='hot',
+                        interpolation='None',
+                        extent=extent,
+                        vmin=0,
+                        vmax=8)
+                    axes[0].set_title('DoLP [%]')
+                    plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+                    im1 = axes[1].imshow(
+                        dolp_min['smoothed_dolp'],
+                        cmap='hot',
+                        interpolation='None',
+                        extent=extent,
+                        vmin=0,
+                        vmax=8)
+                    axes[1].set_title('Smoothed DoLP [%]')
+                    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+                    for ax in axes:
+                        ax.scatter(
+                            azimuth,
+                            altitude,
+                            marker='x',
+                            s=120,
+                            c='cyan',
+                            linewidths=3,
+                            label='WLS NP')
+                        ax.scatter(
+                            dolp_min_location[1],
+                            dolp_min_location[0],
+                            marker='+',
+                            s=160,
+                            c='lime',
+                            linewidths=3,
+                            label='DoLP min NP')
+                        ax.set_xlabel('Azimuth [$\circ$]', fontsize=15)
+                        ax.set_ylabel('Zenith [$\circ$]', fontsize=15)
+                        ax.legend()
+
+                    plt.suptitle(
+                        f'{timestamp, aqnum} '
+                        f'DoLP-WLS offset: '
+                        f'dZen={dolp_min_delta[0]:.4f} deg, '
+                        f'dAz={dolp_min_delta[1]:.4f} deg')
+                    plt.tight_layout()
+
+                    fname = os.path.join(
+                        figurepath,
+                        f'{timestamp}_aq{aqnum:02d}_NP_DoLP_compare.png'
+                        )
+
+                    fig.savefig(fname, dpi=300, bbox_inches='tight')
+                    plt.show()
+                    plt.close(fig)
                 
                 save = input("Save neutral point estimation to file? (Yes/No): ")
                 if save.lower() in ['yes', 'y']:
@@ -386,9 +532,13 @@ for idx in range(i):
                         np_est = f.create_group("Neutral Point Estimation")
 
                     np_est.create_dataset('Estimation NP Location (zen,az) [deg]', data = np.array([altitude, azimuth]))
+                    np_est.create_dataset('DoLP Minimum NP Location (zen,az) [deg]', data = dolp_min_location)
+                    np_est.create_dataset('DoLP Minimum Minus Estimation NP (zen,az) [deg]', data = dolp_min_delta)
                     np_est.create_dataset('Sun Location (zen,az) [deg]', data = np.array([sza, saz]))
                     np_est.attrs['Zenith Error [arcseconds]'] = altitude_error * 3600
                     np_est.attrs['Azimuth Error [arcseconds]'] = azimuth_error * 3600
+                    np_est.attrs['DoLP Minimum Offset [deg]'] = dolp_min_distance
+                    np_est.attrs['DoLP Minimum Method'] = 'median_filter=5, gaussian_sigma=3, lowest 1 percentile weighted centroid in cropped ROI'
                     np_est.attrs['Q Cropped Region'] = q_range_str
                     np_est.attrs['U Cropped Region'] = u_range_str
                     np_est.attrs['Aquisition Number'] = aqnum

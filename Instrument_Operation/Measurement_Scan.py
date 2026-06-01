@@ -90,6 +90,13 @@ pan_offset = -9.#to set origin to sun azimuth
 start_tilt = 0
 end_tilt = 4
 step_tilt = 2
+calibration_dtilts = [-0.5, 0.5, -1.0, 1.0, -1.5, 1.5]
+
+
+def calibration_group_name(dtilt):
+    direction = 'up' if dtilt > 0 else 'down' if dtilt < 0 else 'center'
+    magnitude = f"{abs(float(dtilt)):g}".replace('.', 'p')
+    return f"calibration_acqui_{direction}_{magnitude}"
 
 
 
@@ -156,10 +163,7 @@ mf.move_to_coord_and_wait(moog, initial_pan_command, initial_tilt_command)
 
 measstart=time.time()
 
-for dtilt in range(start_tilt,end_tilt,step_tilt):
-    
-    aq_num = aq_num + 1
-
+def capture_acquisition(group_name, dtilt, acquisition_type, normal_index=None, calibration_index=None):
     #Get sun position and set to initial pan and tilt value for moog
     dt = datetime.now()
     sun_pos = get_position(dt, longitude, latitude)
@@ -202,7 +206,14 @@ for dtilt in range(start_tilt,end_tilt,step_tilt):
                 axis.home()
             
         
-    aq = hdf5_file.create_group(f"Aquistion_{aq_num}")
+    aq = hdf5_file.create_group(group_name)
+    aq.attrs['Acquisition Type'] = acquisition_type
+    if normal_index is not None:
+        aq.attrs['Normal Acquisition Index'] = normal_index
+    if calibration_index is not None:
+        aq.attrs['Calibration Acquisition Index'] = calibration_index
+        aq.attrs['Calibration Direction'] = 'up' if dtilt > 0 else 'down' if dtilt < 0 else 'center'
+        aq.attrs['Calibration Step Magnitude [deg]'] = abs(float(dtilt))
     aq.attrs['Timestamp MDT'] = timestamp
     utc_time = str(dt.astimezone(pytz.utc))
     utc_timestamp = utc_time[11:19].replace(':','_')
@@ -224,10 +235,26 @@ for dtilt in range(start_tilt,end_tilt,step_tilt):
     uvimg.attrs['UV Polarizer Angles'] = str(angles)
 
 
+normal_dtilts = list(range(start_tilt, end_tilt, step_tilt))
+if 0 not in normal_dtilts:
+    normal_dtilts.insert(0, 0)
+
+for normal_index, dtilt in enumerate(normal_dtilts):
+    capture_acquisition(f"Aquistion_{normal_index}", dtilt, 'normal', normal_index=normal_index)
+    if normal_index == 0:
+        for calibration_index, calibration_dtilt in enumerate(calibration_dtilts):
+            capture_acquisition(
+                calibration_group_name(calibration_dtilt),
+                calibration_dtilt,
+                'calibration',
+                calibration_index=calibration_index,
+            )
+
 
 measend=time.time()
 print('Measurment Completed',((measend-measstart)))
 meas.attrs['Total Measurement Time'] = ((measend-measstart)/60)
+meas.attrs['Calibration Delta Tilts [deg]'] = np.array(calibration_dtilts, dtype=float)
 
 sun_pos = get_position(dt, longitude, latitude)
 #Set initial position based on sun location

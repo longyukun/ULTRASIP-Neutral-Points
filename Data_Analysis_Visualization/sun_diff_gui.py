@@ -63,19 +63,61 @@ def center_zenith_from_sun_pixel(aq, fit, fov_center_y=FOV_CENTER_Y):
     return sun_zenith - row_offset
 
 
-def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0):
+def resolve_acquisition_name(selector):
+    text = str(selector).strip()
+    if text.isdigit():
+        return f"Aquistion_{int(text)}"
+    return text
+
+
+def infer_dtilt_from_name(name):
+    if name == "Aquistion_0":
+        return 0.0
+    if name.startswith("Aquistion_"):
+        try:
+            return 2.0 * int(name.split("_", 1)[1])
+        except ValueError:
+            return np.nan
+
+    prefix_down = "calibration_acqui_down_"
+    prefix_up = "calibration_acqui_up_"
+    if name.startswith(prefix_down):
+        value = name[len(prefix_down):].replace("p", ".")
+        try:
+            return -float(value)
+        except ValueError:
+            return np.nan
+    if name.startswith(prefix_up):
+        value = name[len(prefix_up):].replace("p", ".")
+        try:
+            return float(value)
+        except ValueError:
+            return np.nan
+    return np.nan
+
+
+def analyze_h5(
+    path,
+    intensity_mode,
+    aq0_radius_scale=1.0,
+    aq1_radius_scale=1.0,
+    aq0_selector="0",
+    aq1_selector="1",
+):
     cfit.INTENSITY_MODE = intensity_mode
     h5 = h5py.File(path, "r")
     try:
-        if "Aquistion_0" not in h5 or "Aquistion_1" not in h5:
-            raise ValueError("H5 must contain Aquisition_0 and Aquisition_1")
+        aq0_name = resolve_acquisition_name(aq0_selector)
+        aq1_name = resolve_acquisition_name(aq1_selector)
+        if aq0_name not in h5 or aq1_name not in h5:
+            raise ValueError(f"H5 must contain {aq0_name} and {aq1_name}")
 
-        aq0 = h5["Aquistion_0"]
-        aq1 = h5["Aquistion_1"]
+        aq0 = h5[aq0_name]
+        aq1 = h5[aq1_name]
         fit0 = cfit.fit_sun_circle(aq0)
         fit1_free = cfit.fit_sun_circle(aq1)
         if fit0 is None or fit1_free is None:
-            raise ValueError("Could not fit sun circle for both Aquisition_0 and Aquisition_1")
+            raise ValueError(f"Could not fit sun circle for both {aq0_name} and {aq1_name}")
         if aq0_radius_scale != 1.0:
             scaled_fit0 = dict(fit0)
             scaled_fit0["radius"] = fit0["radius"] * aq0_radius_scale
@@ -107,6 +149,12 @@ def analyze_h5(path, intensity_mode, aq0_radius_scale=1.0, aq1_radius_scale=1.0)
             "path": path,
             "file": os.path.basename(path),
             "mode": intensity_mode,
+            "aq0_selector": str(aq0_selector),
+            "aq1_selector": str(aq1_selector),
+            "aq0_name": aq0_name,
+            "aq1_name": aq1_name,
+            "aq0_dtilt": infer_dtilt_from_name(aq0_name),
+            "aq1_dtilt": infer_dtilt_from_name(aq1_name),
             "aq0_radius_scale": aq0_radius_scale,
             "aq1_radius_scale": aq1_radius_scale,
             "fit0": fit0,
@@ -150,6 +198,8 @@ class SunDiffGui:
         self.worker_queue = queue.Queue()
 
         self.intensity_mode = tk.StringVar(value="p0")
+        self.aq0_selector = tk.StringVar(value="0")
+        self.aq1_selector = tk.StringVar(value="1")
         self.aq0_radius_scale = tk.DoubleVar(value=1.0)
         self.aq1_radius_scale = tk.DoubleVar(value=1.0)
         self.log_path = tk.StringVar(value=str(DEFAULT_LOG))
@@ -169,7 +219,13 @@ class SunDiffGui:
         mode_menu = ttk.OptionMenu(toolbar, self.intensity_mode, self.intensity_mode.get(), "p0", "p0_p90")
         mode_menu.pack(side=tk.LEFT)
 
-        ttk.Label(toolbar, text="Aq0 radius x").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Label(toolbar, text="Left aq/group").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(toolbar, textvariable=self.aq0_selector, width=22).pack(side=tk.LEFT)
+
+        ttk.Label(toolbar, text="Right aq/group").pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Entry(toolbar, textvariable=self.aq1_selector, width=22).pack(side=tk.LEFT)
+
+        ttk.Label(toolbar, text="Left radius x").pack(side=tk.LEFT, padx=(12, 4))
         self.aq0_radius_scale_label = ttk.Label(toolbar, text="1.00", width=4)
         self.aq0_radius_scale_label.pack(side=tk.LEFT)
         aq0_radius_scale = ttk.Scale(
@@ -183,7 +239,7 @@ class SunDiffGui:
         )
         aq0_radius_scale.pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Label(toolbar, text="Aq1 radius x").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Label(toolbar, text="Right radius x").pack(side=tk.LEFT, padx=(12, 4))
         self.radius_scale_label = ttk.Label(toolbar, text="1.00", width=4)
         self.radius_scale_label.pack(side=tk.LEFT)
         radius_scale = ttk.Scale(
@@ -230,7 +286,7 @@ class SunDiffGui:
         self._clear_axes()
 
     def _clear_axes(self):
-        for ax, title in ((self.ax0, "Aquisition_0"), (self.ax1, "Aquisition_1")):
+        for ax, title in ((self.ax0, "Left acquisition"), (self.ax1, "Right acquisition")):
             ax.clear()
             ax.set_title(title)
             ax.set_xlabel(f"column / {cfit.DISPLAY_STEP}")
@@ -266,14 +322,33 @@ class SunDiffGui:
 
         thread = threading.Thread(
             target=self._worker,
-            args=(path, self.intensity_mode.get(), self.aq0_radius_scale.get(), self.aq1_radius_scale.get()),
+            args=(
+                path,
+                self.intensity_mode.get(),
+                self.aq0_radius_scale.get(),
+                self.aq1_radius_scale.get(),
+                self.aq0_selector.get(),
+                self.aq1_selector.get(),
+            ),
             daemon=True,
         )
         thread.start()
 
-    def _worker(self, path, intensity_mode, aq0_radius_scale, aq1_radius_scale):
+    def _worker(self, path, intensity_mode, aq0_radius_scale, aq1_radius_scale, aq0_selector, aq1_selector):
         try:
-            self.worker_queue.put(("result", analyze_h5(path, intensity_mode, aq0_radius_scale, aq1_radius_scale)))
+            self.worker_queue.put(
+                (
+                    "result",
+                    analyze_h5(
+                        path,
+                        intensity_mode,
+                        aq0_radius_scale,
+                        aq1_radius_scale,
+                        aq0_selector,
+                        aq1_selector,
+                    ),
+                )
+            )
         except Exception as exc:
             self.worker_queue.put(("error", str(exc)))
 
@@ -306,12 +381,12 @@ class SunDiffGui:
         self.root.after(100, self._poll_worker)
 
     def _plot_result(self, result):
-        self._plot_one(self.ax0, result["display0"], result["fit0"], "Aquisition_0", moog_values=result["aq0_moog"])
+        self._plot_one(self.ax0, result["display0"], result["fit0"], result["aq0_name"], moog_values=result["aq0_moog"])
         self._plot_one(
             self.ax1,
             result["display1"],
             result["fit1"],
-            "Aquisition_1",
+            result["aq1_name"],
             result["fit0"],
             moog_values=result["aq1_moog"],
         )
@@ -322,23 +397,25 @@ class SunDiffGui:
         f0 = result["fit0"]
         f1 = result["fit1"]
         self.status.set(
-            f"{result['file']} | mode={result['mode']} | aq0 radius scale={result['aq0_radius_scale']:.2f} | "
-            f"aq1 radius scale={result['aq1_radius_scale']:.2f} | "
+            f"{result['file']} | {result['aq0_name']} -> {result['aq1_name']} | "
+            f"dtilt=({result['aq0_dtilt']:.2f} -> {result['aq1_dtilt']:.2f}) | "
+            f"mode={result['mode']} | left radius scale={result['aq0_radius_scale']:.2f} | "
+            f"right radius scale={result['aq1_radius_scale']:.2f} | "
             f"sun residual diff={result['diff']:.6f} deg\n"
             f"components: pixel-only={(result['pixel_term']):.6f} deg, "
             f"tilt={result['tilt_term']:.6f} deg ({result['tilt_source']}), "
             f"sun-alt={result['sun_alt_term']:.6f} deg\n"
-            f"FOV center zen from sun: aq0={result['aq0_center_zen_from_sun']:.6f}, "
-            f"aq1={result['aq1_center_zen_from_sun']:.6f}, "
+            f"FOV center zen from sun: left={result['aq0_center_zen_from_sun']:.6f}, "
+            f"right={result['aq1_center_zen_from_sun']:.6f}, "
             f"diff={result['center_zen_diff_from_sun']:.6f} deg\n"
             f"FOV center zen from Moog ({result['tilt_source']}): "
-            f"aq0={result['aq0_center_zen_from_moog']:.6f}, "
-            f"aq1={result['aq1_center_zen_from_moog']:.6f}, "
+            f"left={result['aq0_center_zen_from_moog']:.6f}, "
+            f"right={result['aq1_center_zen_from_moog']:.6f}, "
             f"diff={result['center_zen_diff_from_moog']:.6f} deg\n"
-            f"aq0 pixel=({f0['x']:.1f}, {f0['y']:.1f}), zenith={result['zenith0']:.6f}, "
+            f"left pixel=({f0['x']:.1f}, {f0['y']:.1f}), zenith={result['zenith0']:.6f}, "
             f"r={f0['radius']:.1f}, rmse={f0['rmse']:.1f}, method={f0.get('fit_method', '')}, "
             f"sun_candidate={result['aq0_ok']}\n"
-            f"aq1 pixel=({f1['x']:.1f}, {f1['y']:.1f}), zenith={result['zenith1']:.6f}, "
+            f"right pixel=({f1['x']:.1f}, {f1['y']:.1f}), zenith={result['zenith1']:.6f}, "
             f"r={f1['radius']:.1f}, rmse={f1['rmse']:.1f}, method={f1.get('fit_method', '')}, "
             f"sun_candidate={result['aq1_ok']}"
         )
@@ -404,6 +481,10 @@ class SunDiffGui:
             "file",
             "path",
             "mode",
+            "left_acquisition",
+            "right_acquisition",
+            "left_dtilt_deg",
+            "right_dtilt_deg",
             "aq0_radius_scale",
             "aq1_radius_scale",
             "diff_deg",
@@ -445,6 +526,10 @@ class SunDiffGui:
             "file": r["file"],
             "path": r["path"],
             "mode": r["mode"],
+            "left_acquisition": r["aq0_name"],
+            "right_acquisition": r["aq1_name"],
+            "left_dtilt_deg": f"{r['aq0_dtilt']:.9f}",
+            "right_dtilt_deg": f"{r['aq1_dtilt']:.9f}",
             "aq0_radius_scale": f"{r['aq0_radius_scale']:.6f}",
             "aq1_radius_scale": f"{r['aq1_radius_scale']:.6f}",
             "diff_deg": f"{r['diff']:.9f}",

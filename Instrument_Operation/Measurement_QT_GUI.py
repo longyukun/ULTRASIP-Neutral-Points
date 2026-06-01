@@ -66,6 +66,13 @@ AUTO_EXPOSURE_SATURATION_FRACTION = 0.97
 UV_BIT_DEPTH = 12
 DEFAULT_MOOG_PORT = "COM7"
 DEFAULT_ZABER_PORT = "COM6"
+CALIBRATION_DTILTS_DEG = (-0.5, 0.5, -1.0, 1.0, -1.5, 1.5)
+
+
+def acquisition_group_name_for_dtilt(prefix: str, dtilt: float) -> str:
+    sign = "up" if dtilt > 0 else "down" if dtilt < 0 else "center"
+    magnitude = f"{abs(float(dtilt)):g}".replace(".", "p")
+    return f"{prefix}_{sign}_{magnitude}"
 AUTO_SCAN_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".ultrasip_auto_scan_settings.json")
 
 
@@ -1758,8 +1765,36 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 dtilts = np.array([], dtype=float)
             else:
                 dtilts = np.arange(config["start_tilt"], end_tilt, config["step_tilt"], dtype=float)
+            normal_dtilts = [float(dtilt) for dtilt in dtilts if float(dtilt) >= 0.0]
+            if end_tilt > 0.0 and not any(abs(dtilt) < 1e-9 for dtilt in normal_dtilts):
+                normal_dtilts.insert(0, 0.0)
+
+            acquisition_plan = []
+            if normal_dtilts:
+                acquisition_plan.append({
+                    "group_name": "Aquistion_0",
+                    "dtilt": normal_dtilts[0],
+                    "kind": "normal",
+                    "normal_index": 0,
+                })
+                for calibration_index, calibration_dtilt in enumerate(CALIBRATION_DTILTS_DEG):
+                    acquisition_plan.append({
+                        "group_name": acquisition_group_name_for_dtilt("calibration_acqui", calibration_dtilt),
+                        "dtilt": float(calibration_dtilt),
+                        "kind": "calibration",
+                        "calibration_index": calibration_index,
+                    })
+                for normal_index, dtilt in enumerate(normal_dtilts[1:], start=1):
+                    acquisition_plan.append({
+                        "group_name": f"Aquistion_{normal_index}",
+                        "dtilt": float(dtilt),
+                        "kind": "normal",
+                        "normal_index": normal_index,
+                    })
             measstart = time.time()
             acquisitions_written = 0
+            normal_acquisitions_written = 0
+            calibration_acquisitions_written = 0
             stopped = False
 
             with h5py.File(filepath, "w") as h5:
@@ -1777,12 +1812,20 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Scan Start Tilt Offset [deg]"] = float(config["start_tilt"])
                 meas.attrs["Scan Computed End Tilt Offset [deg]"] = float(end_tilt)
                 meas.attrs["Scan Step Tilt [deg]"] = float(config["step_tilt"])
+                meas.attrs["Calibration Delta Tilts [deg]"] = np.array(CALIBRATION_DTILTS_DEG, dtype=float)
                 meas.attrs["UV Image Width [px]"] = UV_IMAGE_WIDTH_PX
                 meas.attrs["UV Image Height [px]"] = UV_IMAGE_HEIGHT_PX
                 meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
                 meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
 
-                for aq_num, dtilt in enumerate(dtilts):
+                for plan_index, acquisition in enumerate(acquisition_plan):
+                    if self.stop_acquisition_event.is_set():
+                        stopped = True
+                        break
+
+                    group_name = acquisition["group_name"]
+                    dtilt = float(acquisition["dtilt"])
+                    acquisition_kind = acquisition["kind"]
                     dt = datetime.now()
                     sun_azimuth, sun_altitude = solar_position_deg(dt, config["latitude"], config["longitude"])
                     pan = azimuth_to_moog_pan(sun_azimuth)
@@ -1811,7 +1854,14 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         uv_frames.append(np.asarray(frame, dtype=np.uint16))
                     uvmeastime = time.time() - capture_start
 
-                    aq = h5.create_group(f"Aquistion_{aq_num}")
+                    aq = h5.create_group(group_name)
+                    aq.attrs["Acquisition Type"] = acquisition_kind
+                    if acquisition_kind == "normal":
+                        aq.attrs["Normal Acquisition Index"] = int(acquisition["normal_index"])
+                    else:
+                        aq.attrs["Calibration Acquisition Index"] = int(acquisition["calibration_index"])
+                        aq.attrs["Calibration Direction"] = "up" if dtilt > 0 else "down" if dtilt < 0 else "center"
+                        aq.attrs["Calibration Step Magnitude [deg]"] = abs(float(dtilt))
                     aq.attrs["Timestamp Local"] = dt.strftime("%H_%M_%S")
                     aq.attrs["Pan"] = pan
                     aq.attrs["Tilt"] = tilt
@@ -1833,8 +1883,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     uvimg.attrs["UV Polarizer Angles"] = str(angles)
                     uvimg.attrs["UV Image Shape"] = str(uv_stack.shape)
                     acquisitions_written += 1
+                    if acquisition_kind == "normal":
+                        normal_acquisitions_written += 1
+                    else:
+                        calibration_acquisitions_written += 1
 
-                    if aq_num == 0:
+                    if group_name == "Aquistion_0":
                         preview_frames = [frame.copy() for frame in uv_frames[:4]]
                         self.result_queue.put((
                             "auto_preview",
@@ -1854,8 +1908,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.result_queue.put((
                         "auto_progress",
                         {
-                            "aq_num": aq_num,
-                            "total": len(dtilts),
+                            "aq_num": plan_index,
+                            "total": len(acquisition_plan),
+                            "group_name": group_name,
+                            "acquisition_type": acquisition_kind,
                             "dtilt": float(dtilt),
                             "filepath": filepath,
                             "status": moog_status,
@@ -1868,11 +1924,15 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Total Measurement Time"] = (time.time() - measstart) / 60.0
                 meas.attrs["Acquisition Stopped"] = int(stopped)
                 meas.attrs["Completed Acquisitions"] = acquisitions_written
+                meas.attrs["Completed Normal Acquisitions"] = normal_acquisitions_written
+                meas.attrs["Completed Calibration Acquisitions"] = calibration_acquisitions_written
 
             return {
                 "filepath": filepath,
                 "acquisitions": acquisitions_written,
-                "planned_acquisitions": len(dtilts),
+                "planned_acquisitions": len(acquisition_plan),
+                "normal_acquisitions": normal_acquisitions_written,
+                "calibration_acquisitions": calibration_acquisitions_written,
                 "stopped": stopped,
                 "target_altitude": target_altitude,
                 "actual_altitude": actual_altitude,
@@ -2060,8 +2120,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.current_status = result["status"]
                     self.apply_status()
                     self.log_msg(
-                        f"Auto scan acquisition {result['aq_num'] + 1}/{result['total']}, "
-                        f"dtilt={result['dtilt']:.2f}, file={result['filepath']}"
+                        f"Auto scan {result['group_name']} ({result['aq_num'] + 1}/{result['total']}, "
+                        f"{result['acquisition_type']}), dtilt={result['dtilt']:.2f}, file={result['filepath']}"
                     )
                 elif kind == "auto_preview":
                     frames = result.get("frames", [])

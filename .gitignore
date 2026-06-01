@@ -1,1 +1,3 @@
 Data_Analysis_Visualization/__pycache__/pixel_metadata.cpython-310.pyc
+*.npy
+*.npz
