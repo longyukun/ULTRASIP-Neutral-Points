@@ -100,15 +100,9 @@ def moog_command_pointing(pan_deg: float, tilt_deg: float) -> Tuple[float, float
 
 
 def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) -> Tuple[float, float]:
-    if suncalc_get_position is not None:
-        pos = suncalc_get_position(dt, longitude_deg, latitude_deg)
-        # SunCalc follows the original scripts: azimuth is south=0, west positive.
-        # Convert it to compass azimuth here so all callers use one convention.
-        compass_azimuth = (float(np.degrees(pos["azimuth"])) + 180.0) % 360.0
-        return compass_azimuth, float(np.degrees(pos["altitude"]))
-
-    # NOAA-style approximation. Good enough for GUI trigger monitoring; use
-    # suncalc when installed for consistency with the original acquisition code.
+    # Return compass azimuth: north=0, east=90, south=180, west=270.
+    # Do not use SunCalc here; Python SunCalc variants disagree on azimuth
+    # convention, which can flip a south-facing Moog command by 180 degrees.
     local_dt = dt.astimezone()
     day = local_dt.timetuple().tm_yday
     hour = local_dt.hour + local_dt.minute / 60.0 + local_dt.second / 3600.0
