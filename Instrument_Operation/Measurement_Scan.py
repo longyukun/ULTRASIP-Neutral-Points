@@ -31,7 +31,7 @@ def auto_exposure_all_angles(camera, axis, angles,
                               target_median=2600, 
                               initial_exp=1e5, 
                               max_exp=1e6,
-                              min_exp=500,
+                              min_exp=100,
                               saturation_thresh=0.97, 
                               bit_depth=12):
     from numpy import median, clip, array

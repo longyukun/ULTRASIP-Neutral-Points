@@ -14,21 +14,23 @@ def pixel_geometry(sza0,HFOV,VFOV,img_x,img_y,x_center, y_center, Pan, Tilt, Sun
         
         delta_zen = (Sun_Position_Altitude-sza0)
        # print(delta_zen)
-        view_az = np.zeros((img_x,img_y))
-        view_zen = np.zeros((img_x,img_y))
 
-        # Create the grid of indices
-        x = np.arange(img_x)
-        y = np.arange(img_y)
-        xx, yy = np.meshgrid(x, y, indexing='ij')
+        # OpenCV reports centroids as x=column and y=row. With indexing='ij',
+        # rr is the image row index and cc is the image column index.
+        rows = np.arange(img_y)
+        cols = np.arange(img_x)
+        rr, cc = np.meshgrid(rows, cols, indexing='ij')
+
+        row_center = y_center
+        col_center = x_center
 
         # Compute deviations
-        x_dev = (x_center - xx) * HFOV
-        y_dev = (y_center - yy) * VFOV
+        row_dev = (rr - row_center) * VFOV
+        col_dev = (col_center - cc) * HFOV
 
         # Compute view angles
-        view_az = np.radians(Pan - y_dev)
-        view_zen = np.radians((Tilt-delta_zen) - x_dev)
+        view_az = np.radians(Pan - col_dev)
+        view_zen = np.radians((Tilt-delta_zen) - row_dev)
         sun_az = np.radians(Sun_Position_Azimuth)
         sun_zen = np.radians(Sun_Position_Altitude-delta_zen)
         

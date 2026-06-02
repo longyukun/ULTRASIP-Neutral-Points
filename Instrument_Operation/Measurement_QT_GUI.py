@@ -53,6 +53,10 @@ MOOG_RESOLUTION_DEG = 0.01
 MOOG_COMMAND_RESOLUTION_DEG = 0.1
 CENTERING_PAN_PROBE_DEG = MOOG_COMMAND_RESOLUTION_DEG
 CENTERING_MIN_PROBE_SHIFT_PX = 2.0
+PREVIEW_MAX_SIDE_PX = 720
+PREVIEW_CENTER_MAX_SIDE_PX = 900
+PREVIEW_CENTER_DETECT_INTERVAL = 3
+PREVIEW_AUTO_EXPOSURE_INTERVAL = 5
 UV_IMAGE_WIDTH_PX = 2848
 UV_IMAGE_HEIGHT_PX = 2848
 UV_FULL_FOV_DEG = 5.78
@@ -60,7 +64,9 @@ UV_ARCSEC_PER_PIXEL = 7.20
 UV_DEG_PER_PIXEL = UV_ARCSEC_PER_PIXEL / 3600.0
 DEFAULT_EXPOSURE_US = 1000.0
 AUTO_EXPOSURE_TARGET_MEDIAN = 2600.0
-AUTO_EXPOSURE_MIN_US = 500.0
+AUTO_EXPOSURE_TEST_US = 100_000.0
+AUTO_EXPOSURE_FIXED_NEAR_SUN_US = 800.0
+AUTO_EXPOSURE_MIN_US = 100.0
 AUTO_EXPOSURE_MAX_US = 1_000_000.0
 AUTO_EXPOSURE_SATURATION_FRACTION = 0.97
 UV_BIT_DEPTH = 12
@@ -701,16 +707,21 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self._rescale()
 
         def set_frame(self, frame, center=None):
-            qimage = frame_to_qimage(frame, QtGui)
+            image = np.asarray(frame)
+            stride = max(1, int(math.ceil(max(image.shape[:2]) / float(PREVIEW_MAX_SIDE_PX))))
+            preview = image[::stride, ::stride]
+            qimage = frame_to_qimage(preview, QtGui)
             pixmap = QtGui.QPixmap.fromImage(qimage)
             if center:
                 painter = QtGui.QPainter(pixmap)
                 pen = QtGui.QPen(QtGui.QColor(0, 255, 0))
-                pen.setWidth(3)
+                pen.setWidth(2)
                 painter.setPen(pen)
                 cx, cy = center
-                painter.drawLine(int(cx - 20), int(cy), int(cx + 20), int(cy))
-                painter.drawLine(int(cx), int(cy - 20), int(cx), int(cy + 20))
+                cx = float(cx) / stride
+                cy = float(cy) / stride
+                painter.drawLine(int(cx - 12), int(cy), int(cx + 12), int(cy))
+                painter.drawLine(int(cx), int(cy - 12), int(cx), int(cy + 12))
                 painter.end()
             self.last_pixmap = pixmap
             self._rescale()
@@ -861,6 +872,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.current_output_text = ""
             self.pan_offset = 0.0
             self.tilt_offset = 0.0
+            self.auto_exposure_mode = "median"
+            self.auto_exposure_max_us = AUTO_EXPOSURE_MAX_US
             self.calibration_complete = False
             self.completed_sun_targets = set()
             self.queued_sun_trigger = None
@@ -877,10 +890,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.result_queue = queue.Queue()
             self.camera_pending = False
             self.status_pending = False
+            self.preview_frame_counter = 0
             self.current_status = self.moog.get_status()
 
             self.timer = QtCore.QTimer(self)
-            self.timer.setInterval(400)
+            self.timer.setInterval(700)
             self.timer.timeout.connect(self.request_frame_update)
 
             self.result_timer = QtCore.QTimer(self)
@@ -1183,13 +1197,26 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.target_median.setDecimals(0)
             self.target_median.setSingleStep(100.0)
             self.target_median.setValue(AUTO_EXPOSURE_TARGET_MEDIAN)
+            self.auto_exposure_metric = QtWidgets.QComboBox()
+            self.auto_exposure_metric.addItems(["Median", "Max"])
+            self.auto_exposure_metric.currentTextChanged.connect(self.set_auto_exposure_mode)
+            self.max_exposure_us = QtWidgets.QDoubleSpinBox()
+            self.max_exposure_us.setRange(AUTO_EXPOSURE_MIN_US, AUTO_EXPOSURE_MAX_US)
+            self.max_exposure_us.setDecimals(0)
+            self.max_exposure_us.setSingleStep(10_000.0)
+            self.max_exposure_us.setValue(self.auto_exposure_max_us)
+            self.max_exposure_us.valueChanged.connect(self.set_auto_exposure_max)
             self.exposure_status = QtWidgets.QLabel("Manual: 1000 us")
             exposure_layout.addWidget(self.auto_exposure_check, 0, 0, 1, 2)
             exposure_layout.addWidget(QtWidgets.QLabel("Exposure [us]"), 1, 0)
             exposure_layout.addWidget(self.exposure_us, 1, 1)
             exposure_layout.addWidget(QtWidgets.QLabel("Target median"), 2, 0)
             exposure_layout.addWidget(self.target_median, 2, 1)
-            exposure_layout.addWidget(self.exposure_status, 3, 0, 1, 2)
+            exposure_layout.addWidget(QtWidgets.QLabel("Auto metric"), 3, 0)
+            exposure_layout.addWidget(self.auto_exposure_metric, 3, 1)
+            exposure_layout.addWidget(QtWidgets.QLabel("Max exposure [us]"), 4, 0)
+            exposure_layout.addWidget(self.max_exposure_us, 4, 1)
+            exposure_layout.addWidget(self.exposure_status, 5, 0, 1, 2)
 
             remote_group = QtWidgets.QGroupBox("Remote control")
             remote_layout = QtWidgets.QGridLayout(remote_group)
@@ -1350,6 +1377,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "location": self.location_input.text().strip(),
                 "output_dir": self.output_dir_input.text().strip(),
                 "sun_trigger_enabled": bool(self.sun_trigger_enabled),
+                "auto_exposure_mode": self.auto_exposure_mode,
+                "auto_exposure_max_us": self.auto_exposure_max_us,
             }
 
         def apply_auto_scan_settings_payload(self, settings):
@@ -1377,6 +1406,16 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 self.pan_offset = quantize_pointing(settings["pan_offset"])
             if "tilt_offset" in settings:
                 self.tilt_offset = quantize_pointing(settings["tilt_offset"])
+            if "auto_exposure_mode" in settings:
+                self.auto_exposure_mode = str(settings["auto_exposure_mode"]).lower()
+                if self.auto_exposure_mode not in ("median", "max"):
+                    self.auto_exposure_mode = "median"
+                if hasattr(self, "auto_exposure_metric"):
+                    self.auto_exposure_metric.setCurrentText(self.auto_exposure_mode.title())
+            if "auto_exposure_max_us" in settings:
+                self.auto_exposure_max_us = float(settings["auto_exposure_max_us"])
+                if hasattr(self, "max_exposure_us"):
+                    self.max_exposure_us.setValue(self.auto_exposure_max_us)
             self.sun_trigger_enabled = bool(settings.get("sun_trigger_enabled", True))
 
         def load_auto_scan_settings(self):
@@ -1404,7 +1443,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "Location={location}, output={output}\n"
                 "Sun trigger={sun_trigger}; targets {start:.1f}-{end:.1f} deg step {step:.1f}, tol {tol:.2f}, check {interval:d}s\n"
                 "Offsets pan={pan_offset:.2f}, tilt={tilt_offset:.2f}; scan dtilt start {tilt_start:.1f}, step {tilt_step:.1f}\n"
-                "Polarizer={angles}".format(
+                "Auto exposure: {metric}, fixed {fixed_exp:.0f} us for dtilt<3, min {min_exp:.0f} us, max {max_exp:.0f} us; Polarizer={angles}".format(
                     location=self.location_input.text().strip() or "ULTRASIP",
                     output=self.output_dir_input.text().strip() or os.getcwd(),
                     sun_trigger="ON" if self.sun_trigger_enabled else "OFF",
@@ -1417,6 +1456,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     tilt_offset=self.tilt_offset,
                     tilt_start=self.start_tilt_input.value(),
                     tilt_step=self.scan_step_tilt_input.value(),
+                    metric=self.auto_exposure_mode,
+                    fixed_exp=AUTO_EXPOSURE_FIXED_NEAR_SUN_US,
+                    min_exp=AUTO_EXPOSURE_MIN_US,
+                    max_exp=self.auto_exposure_max_us,
                     angles=self.polarizer_angles_input.text().strip(),
                 )
             )
@@ -1479,14 +1522,30 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             add_double(10, "start_tilt", "Scan start tilt offset [deg]", self.start_tilt_input, 0.0, 90.0, 1, 0.1)
             add_double(11, "scan_step_tilt", "Scan step tilt [deg]", self.scan_step_tilt_input, 0.1, 20.0, 1, 0.1)
 
+            auto_exposure_mode = QtWidgets.QComboBox()
+            auto_exposure_mode.addItems(["Median", "Max"])
+            auto_exposure_mode.setCurrentText(self.auto_exposure_mode.title())
+            layout.addWidget(QtWidgets.QLabel("Auto exposure metric"), 12, 0)
+            layout.addWidget(auto_exposure_mode, 12, 1)
+            fields["auto_exposure_mode"] = auto_exposure_mode
+
+            auto_exposure_max = QtWidgets.QDoubleSpinBox()
+            auto_exposure_max.setRange(AUTO_EXPOSURE_MIN_US, AUTO_EXPOSURE_MAX_US)
+            auto_exposure_max.setDecimals(0)
+            auto_exposure_max.setSingleStep(10_000.0)
+            auto_exposure_max.setValue(self.auto_exposure_max_us)
+            layout.addWidget(QtWidgets.QLabel("Max exposure [us]"), 13, 0)
+            layout.addWidget(auto_exposure_max, 13, 1)
+            fields["auto_exposure_max_us"] = auto_exposure_max
+
             polarizer_angles = QtWidgets.QLineEdit(self.polarizer_angles_input.text())
-            layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), 12, 0)
-            layout.addWidget(polarizer_angles, 12, 1)
+            layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), 14, 0)
+            layout.addWidget(polarizer_angles, 14, 1)
             fields["polarizer_angles"] = polarizer_angles
 
             location = QtWidgets.QLineEdit(self.location_input.text())
-            layout.addWidget(QtWidgets.QLabel("Location"), 13, 0)
-            layout.addWidget(location, 13, 1)
+            layout.addWidget(QtWidgets.QLabel("Location"), 15, 0)
+            layout.addWidget(location, 15, 1)
             fields["location"] = location
 
             output_dir = QtWidgets.QLineEdit(self.output_dir_input.text())
@@ -1499,13 +1558,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             output_row = QtWidgets.QHBoxLayout()
             output_row.addWidget(output_dir)
             output_row.addWidget(browse)
-            layout.addWidget(QtWidgets.QLabel("Output folder"), 14, 0)
-            layout.addLayout(output_row, 14, 1)
+            layout.addWidget(QtWidgets.QLabel("Output folder"), 16, 0)
+            layout.addLayout(output_row, 16, 1)
             fields["output_dir"] = output_dir
 
             dialog_buttons = getattr(QtWidgets.QDialogButtonBox, "StandardButton", QtWidgets.QDialogButtonBox)
             buttons = QtWidgets.QDialogButtonBox(dialog_buttons.Save | dialog_buttons.Cancel)
-            layout.addWidget(buttons, 15, 0, 1, 2)
+            layout.addWidget(buttons, 17, 0, 1, 2)
 
             def save_and_close():
                 try:
@@ -1527,6 +1586,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.tilt_offset = quantize_pointing(fields["tilt_offset"].value())
                     self.start_tilt_input.setValue(fields["start_tilt"].value())
                     self.scan_step_tilt_input.setValue(fields["scan_step_tilt"].value())
+                    self.set_auto_exposure_mode(fields["auto_exposure_mode"].currentText())
+                    self.set_auto_exposure_max(fields["auto_exposure_max_us"].value())
                     self.polarizer_angles_input.setText(",".join(f"{angle:g}" for angle in parsed_angles))
                     self.location_input.setText(fields["location"].text())
                     self.output_dir_input.setText(fields["output_dir"].text())
@@ -1587,6 +1648,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "uv_wavelength": "355 FWHM 10nm",
                 "auto_exposure": self.auto_exposure_check.isChecked(),
                 "target_median": self.target_median.value(),
+                "auto_exposure_mode": self.auto_exposure_mode,
+                "auto_exposure_max_us": self.auto_exposure_max_us,
             }
 
         def run_auto_scan_now(self):
@@ -1813,6 +1876,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Scan Computed End Tilt Offset [deg]"] = float(end_tilt)
                 meas.attrs["Scan Step Tilt [deg]"] = float(config["step_tilt"])
                 meas.attrs["Calibration Delta Tilts [deg]"] = np.array(CALIBRATION_DTILTS_DEG, dtype=float)
+                meas.attrs["Auto Exposure Enabled"] = int(config["auto_exposure"])
+                meas.attrs["Auto Exposure Metric"] = config["auto_exposure_mode"]
+                meas.attrs["Auto Exposure Target Median"] = float(config["target_median"])
+                meas.attrs["Auto Exposure Initial Test [us]"] = AUTO_EXPOSURE_TEST_US
+                meas.attrs["Auto Exposure Fixed Near Sun [us]"] = AUTO_EXPOSURE_FIXED_NEAR_SUN_US
+                meas.attrs["Auto Exposure Min [us]"] = AUTO_EXPOSURE_MIN_US
+                meas.attrs["Auto Exposure Max [us]"] = float(config["auto_exposure_max_us"])
                 meas.attrs["UV Image Width [px]"] = UV_IMAGE_WIDTH_PX
                 meas.attrs["UV Image Height [px]"] = UV_IMAGE_HEIGHT_PX
                 meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
@@ -1838,6 +1908,22 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         moog_status = self.moog.move_absolute(target_pan, target_tilt)
                         self.current_status = moog_status
 
+                    exposure_info = None
+                    if config["auto_exposure"]:
+                        if dtilt < 3:
+                            with self.camera_lock:
+                                self.camera.set_exposure(AUTO_EXPOSURE_FIXED_NEAR_SUN_US)
+                            exposure_info = f"Fixed exposure for dtilt<3: {AUTO_EXPOSURE_FIXED_NEAR_SUN_US:.0f} us"
+                        else:
+                            exposure_info = self.auto_exposure_all_angles(
+                                angles,
+                                moog_status.pan_deg,
+                                moog_status.tilt_deg,
+                                target_median=config["target_median"],
+                                metric=config["auto_exposure_mode"],
+                                max_exposure_us=config["auto_exposure_max_us"],
+                            )
+
                     uv_frames = []
                     capture_start = time.time()
                     for angle in angles:
@@ -1847,10 +1933,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         with self.camera_lock:
                             self.update_sim_camera_site()
                             frame = self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
-                            if config["auto_exposure"]:
-                                self.calculate_auto_exposure(frame, target_median=config["target_median"])
-                                self.update_sim_camera_site()
-                                frame = self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
                         uv_frames.append(np.asarray(frame, dtype=np.uint16))
                     uvmeastime = time.time() - capture_start
 
@@ -1878,6 +1960,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     uv_stack = np.stack(uv_frames, axis=0)
                     uvimg.create_dataset("UV Raw Images", data=uv_stack, compression="gzip")
                     uvimg.attrs["UV Exposure Time"] = float(self.camera.get_exposure())
+                    uvimg.attrs["UV Auto Exposure Enabled"] = int(config["auto_exposure"])
+                    uvimg.attrs["UV Auto Exposure Metric"] = config["auto_exposure_mode"]
+                    uvimg.attrs["UV Auto Exposure Info"] = "" if exposure_info is None else exposure_info
+                    uvimg.attrs["UV Auto Exposure Min [us]"] = AUTO_EXPOSURE_MIN_US
+                    uvimg.attrs["UV Auto Exposure Max [us]"] = float(config["auto_exposure_max_us"])
                     uvimg.attrs["UV Bandpass"] = config["uv_wavelength"]
                     uvimg.attrs["UV Image Capture Time"] = uvmeastime
                     uvimg.attrs["UV Polarizer Angles"] = str(angles)
@@ -2377,6 +2464,31 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.exposure_status.setText(f"{mode}: {self.camera.get_exposure():.0f} us")
             self.apply_status()
 
+        def set_auto_exposure_mode(self, mode):
+            self.auto_exposure_mode = str(mode).strip().lower()
+            if self.auto_exposure_mode not in ("median", "max"):
+                self.auto_exposure_mode = "median"
+            metric = getattr(self, "auto_exposure_metric", None)
+            if metric is not None and metric.currentText().lower() != self.auto_exposure_mode:
+                metric.blockSignals(True)
+                metric.setCurrentText(self.auto_exposure_mode.title())
+                metric.blockSignals(False)
+            self.update_settings_summary()
+            self.log_msg(f"Auto exposure metric set to {self.auto_exposure_mode}")
+
+        def set_auto_exposure_max(self, exposure_us):
+            self.auto_exposure_max_us = float(exposure_us)
+            self.exposure_us.setMaximum(self.auto_exposure_max_us)
+            if self.exposure_us.value() > self.auto_exposure_max_us:
+                self.exposure_us.setValue(self.auto_exposure_max_us)
+            max_widget = getattr(self, "max_exposure_us", None)
+            if max_widget is not None and abs(max_widget.value() - self.auto_exposure_max_us) > 0.5:
+                max_widget.blockSignals(True)
+                max_widget.setValue(self.auto_exposure_max_us)
+                max_widget.blockSignals(False)
+            self.update_settings_summary()
+            self.log_msg(f"Auto exposure max set to {self.auto_exposure_max_us:.0f} us")
+
         def set_manual_exposure(self, exposure_us):
             if self.auto_exposure_check.isChecked():
                 return
@@ -2389,45 +2501,146 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.exposure_status.setText(f"Manual: {float(exposure_us):.0f} us")
             self.submit_worker("camera", task)
 
+        def auto_exposure_all_angles(
+            self,
+            angles,
+            pan_deg,
+            tilt_deg,
+            target_median=AUTO_EXPOSURE_TARGET_MEDIAN,
+            metric="median",
+            max_exposure_us=None,
+        ):
+            max_pixel_value = 2 ** UV_BIT_DEPTH - 1
+            saturation_limit = max_pixel_value * AUTO_EXPOSURE_SATURATION_FRACTION
+            metric = str(metric).strip().lower()
+            if metric not in ("median", "max"):
+                metric = "median"
+            exposure_limit = float(self.auto_exposure_max_us if max_exposure_us is None else max_exposure_us)
+
+            with self.camera_lock:
+                self.camera.set_exposure(AUTO_EXPOSURE_TEST_US)
+
+            medians = []
+            maxima = []
+            saturated = []
+            for angle in angles:
+                with self.motion_lock:
+                    self.polarizer.move_absolute(angle)
+                time.sleep(0.5)
+
+                with self.camera_lock:
+                    self.update_sim_camera_site()
+                    frame = self.camera.get_frame(pan_deg, tilt_deg)
+                data = np.asarray(frame, dtype=np.uint16)
+                med = float(np.median(data))
+                max_value = float(np.max(data))
+                medians.append(med)
+                maxima.append(max_value)
+                saturated.append(max_value >= saturation_limit)
+
+            medians_array = np.asarray(medians, dtype=float)
+            maxima_array = np.asarray(maxima, dtype=float)
+            avg_median = float(np.mean(medians_array))
+            avg_max = float(np.mean(maxima_array))
+
+            if all(saturated):
+                new_exposure = AUTO_EXPOSURE_MIN_US
+                reason = "all test angles saturated"
+            elif metric == "max":
+                if avg_max == 0:
+                    new_exposure = AUTO_EXPOSURE_MIN_US
+                    reason = "zero max"
+                else:
+                    scale = saturation_limit / avg_max
+                    new_exposure = float(np.clip(
+                        AUTO_EXPOSURE_TEST_US * scale,
+                        AUTO_EXPOSURE_MIN_US,
+                        exposure_limit,
+                    ))
+                    reason = "adaptive max"
+            elif avg_median == 0:
+                new_exposure = AUTO_EXPOSURE_MIN_US
+                reason = "zero median"
+            else:
+                scale = float(target_median) / avg_median
+                new_exposure = float(np.clip(
+                    AUTO_EXPOSURE_TEST_US * scale,
+                    AUTO_EXPOSURE_MIN_US,
+                    exposure_limit,
+                ))
+                reason = "adaptive median"
+
+            with self.camera_lock:
+                self.camera.set_exposure(new_exposure)
+
+            return (
+                f"Auto exposure all angles: medians={medians_array.astype(int).tolist()}, "
+                f"maxima={maxima_array.astype(int).tolist()}, metric={metric}, "
+                f"target median={float(target_median):.0f}, target max={saturation_limit:.0f}, "
+                f"exposure={new_exposure:.0f} us, limit={exposure_limit:.0f} us, {reason}"
+            )
+
         def calculate_auto_exposure(self, frame, target_median=None):
             image = np.asarray(frame, dtype=np.float32)
             median = float(np.median(image))
+            image_max = float(np.max(image))
             max_value = float(2 ** UV_BIT_DEPTH - 1)
+            target_max = max_value * AUTO_EXPOSURE_SATURATION_FRACTION
             saturated_fraction = float(np.mean(image >= max_value * AUTO_EXPOSURE_SATURATION_FRACTION))
             current = float(self.camera.get_exposure())
 
             if saturated_fraction > 0.01:
                 proposed = current * 0.5
+            elif self.auto_exposure_mode == "max":
+                if image_max <= 0:
+                    proposed = AUTO_EXPOSURE_MIN_US
+                else:
+                    proposed = current * np.clip(target_max / image_max, 0.25, 4.0)
             elif median <= 0:
                 proposed = AUTO_EXPOSURE_MIN_US
             else:
                 scale = (self.target_median.value() if target_median is None else target_median) / median
                 proposed = current * np.clip(scale, 0.25, 4.0)
 
-            new_exposure = float(np.clip(proposed, AUTO_EXPOSURE_MIN_US, AUTO_EXPOSURE_MAX_US))
+            new_exposure = float(np.clip(proposed, AUTO_EXPOSURE_MIN_US, self.auto_exposure_max_us))
             if abs(new_exposure - current) / max(current, 1.0) > 0.02:
                 self.camera.set_exposure(new_exposure)
 
-            return f"Auto: {self.camera.get_exposure():.0f} us, median={median:.0f}, sat={saturated_fraction * 100:.2f}%"
+            return (
+                f"Auto {self.auto_exposure_mode}: {self.camera.get_exposure():.0f} us, "
+                f"median={median:.0f}, max={image_max:.0f}, sat={saturated_fraction * 100:.2f}%"
+            )
 
         def request_frame_update(self):
             if self.camera_pending:
                 return
             self.camera_pending = True
+            self.preview_frame_counter += 1
             auto_exposure = self.auto_exposure_check.isChecked()
+            run_auto_exposure = auto_exposure and self.preview_frame_counter % PREVIEW_AUTO_EXPOSURE_INTERVAL == 0
+            run_center_detection = self.preview_frame_counter % PREVIEW_CENTER_DETECT_INTERVAL == 0
             pan_deg = self.current_status.pan_deg
             tilt_deg = self.current_status.tilt_deg
+            previous_center = self.last_center
 
             def task():
                 with self.camera_lock:
                     self.update_sim_camera_site()
                     frame = self.camera.get_frame(pan_deg, tilt_deg)
                     exposure_info = None
-                    if auto_exposure:
+                    if run_auto_exposure:
                         exposure_info = self.calculate_auto_exposure(frame)
                         self.update_sim_camera_site()
                         frame = self.camera.get_frame(pan_deg, tilt_deg)
-                center, _ = detect_sun_center(frame)
+                if run_center_detection:
+                    stride = max(1, int(math.ceil(max(frame.shape[:2]) / float(PREVIEW_CENTER_MAX_SIDE_PX))))
+                    center_small, _ = detect_sun_center(frame[::stride, ::stride])
+                    center = None if center_small is None else (
+                        float(center_small[0]) * stride,
+                        float(center_small[1]) * stride,
+                    )
+                else:
+                    center = previous_center
                 return frame, center, exposure_info
 
             self.submit_worker("frame", task)
@@ -2555,7 +2768,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "camera_connected": bool(getattr(self.camera, "connected", False)),
                 "camera_exposure_us": float(self.camera.get_exposure()),
                 "auto_exposure": bool(self.auto_exposure_check.isChecked()),
+                "auto_exposure_mode": self.auto_exposure_mode,
                 "auto_exposure_target_median": float(self.target_median.value()),
+                "auto_exposure_min_us": AUTO_EXPOSURE_MIN_US,
+                "auto_exposure_max_us": float(self.auto_exposure_max_us),
                 "polarizer_angle_deg": float(getattr(self.polarizer, "angle_deg", 0.0)),
                 "deg_per_pixel": self.deg_per_pixel.value(),
                 "last_center": self.last_center_result,
@@ -2748,9 +2964,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     cal.attrs["Polarizer Angle [deg]"] = float(getattr(self.polarizer, "angle_deg", 0.0))
                     cal.attrs["Camera Exposure [us]"] = float(self.camera.get_exposure())
                     cal.attrs["Auto Exposure Enabled"] = int(self.auto_exposure_check.isChecked())
+                    cal.attrs["Auto Exposure Metric"] = self.auto_exposure_mode
                     cal.attrs["Auto Exposure Target Median"] = float(self.target_median.value())
                     cal.attrs["Auto Exposure Min [us]"] = AUTO_EXPOSURE_MIN_US
-                    cal.attrs["Auto Exposure Max [us]"] = AUTO_EXPOSURE_MAX_US
+                    cal.attrs["Auto Exposure Max [us]"] = float(self.auto_exposure_max_us)
                     cal.attrs["Auto Exposure Saturation Fraction"] = AUTO_EXPOSURE_SATURATION_FRACTION
                     cal.attrs["Deg Per Pixel Used"] = float(self.deg_per_pixel.value())
                     cal.attrs["Arcsec Per Pixel Used"] = float(self.deg_per_pixel.value() * 3600.0)
