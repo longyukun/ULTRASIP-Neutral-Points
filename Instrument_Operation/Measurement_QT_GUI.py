@@ -57,6 +57,7 @@ PREVIEW_MAX_SIDE_PX = 720
 PREVIEW_CENTER_MAX_SIDE_PX = 900
 PREVIEW_CENTER_DETECT_INTERVAL = 3
 PREVIEW_AUTO_EXPOSURE_INTERVAL = 5
+PREVIEW_FRAME_ERROR_BACKOFF_SEC = 3.0
 UV_IMAGE_WIDTH_PX = 2848
 UV_IMAGE_HEIGHT_PX = 2848
 UV_FULL_FOV_DEG = 5.78
@@ -143,12 +144,12 @@ def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) 
 
 
 def azimuth_to_moog_pan(azimuth_deg: float) -> float:
-    """Convert compass azimuth to Moog pan when pan=0 points south."""
-    return 180.0 - (float(azimuth_deg) % 360.0)
+    """Convert compass azimuth to Moog/SunCalc pan: south=0, west positive."""
+    return (float(azimuth_deg) - 180.0 + 180.0) % 360.0 - 180.0
 
 
 def moog_pan_to_azimuth(pan_deg: float) -> float:
-    return (180.0 - float(pan_deg)) % 360.0
+    return (float(pan_deg) + 180.0) % 360.0
 
 
 def import_qt():
@@ -456,6 +457,10 @@ class RealVmbCameraController:
         self.vmb_cm = None
         self.cam_cm = None
         self.camera = None
+        self.frame_count = 0
+        self.failed_frame_count = 0
+        self.last_frame_duration_ms = 0.0
+        self.last_frame_error = ""
 
     def open(self):
         import uv_cam_functions as uv
@@ -469,6 +474,9 @@ class RealVmbCameraController:
             self.cam_cm.__enter__()
             uv.setup_camera(self.camera, self.exposure_us)
             self.connected = True
+            self.frame_count = 0
+            self.failed_frame_count = 0
+            self.last_frame_error = ""
         except Exception:
             self.close()
             raise
@@ -491,10 +499,66 @@ class RealVmbCameraController:
     def get_exposure(self):
         return self.exposure_us
 
+    def _feature_value(self, name):
+        if self.camera is None:
+            return None
+        feature = getattr(self.camera, name, None)
+        if feature is None:
+            return None
+        try:
+            return feature.get()
+        except Exception:
+            return None
+
+    def diagnostics(self):
+        values = {
+            "connected": self.connected,
+            "camera_id": None,
+            "exposure_us": self.exposure_us,
+            "frames_ok": self.frame_count,
+            "frames_failed": self.failed_frame_count,
+            "last_frame_ms": round(self.last_frame_duration_ms, 1),
+        }
+        if self.camera is not None:
+            try:
+                values["camera_id"] = self.camera.get_id()
+            except Exception:
+                values["camera_id"] = None
+            for name in (
+                "ExposureTime",
+                "Width",
+                "Height",
+                "PixelFormat",
+                "AcquisitionMode",
+                "TriggerMode",
+                "DeviceLinkThroughputLimit",
+                "GevSCPSPacketSize",
+            ):
+                value = self._feature_value(name)
+                if value is not None:
+                    values[name] = value
+        if self.last_frame_error:
+            values["last_error"] = self.last_frame_error
+        return values
+
     def get_frame(self, pan_deg: float = 0.0, tilt_deg: float = 0.0):
         if not self.connected or self.camera is None:
             raise RuntimeError("Camera is not open.")
-        frame = self.camera.get_frame()
+        start = time.time()
+        try:
+            frame = self.camera.get_frame()
+        except Exception as exc:
+            self.failed_frame_count += 1
+            self.last_frame_duration_ms = (time.time() - start) * 1000.0
+            self.last_frame_error = str(exc)
+            raise RuntimeError(
+                "Camera get_frame timed out or failed "
+                f"after {self.last_frame_duration_ms:.1f} ms; "
+                f"diagnostics={self.diagnostics()}; original={exc}"
+            ) from exc
+        self.frame_count += 1
+        self.last_frame_duration_ms = (time.time() - start) * 1000.0
+        self.last_frame_error = ""
         data = np.frombuffer(frame.get_buffer(), dtype=np.uint16)
         height = int(getattr(frame, "get_height", lambda: 0)())
         width = int(getattr(frame, "get_width", lambda: 0)())
@@ -890,7 +954,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.result_queue = queue.Queue()
             self.camera_pending = False
             self.status_pending = False
+            self.resume_preview_after_scan = False
             self.preview_frame_counter = 0
+            self.frame_error_count = 0
+            self.camera_retry_until = 0.0
             self.current_status = self.moog.get_status()
 
             self.timer = QtCore.QTimer(self)
@@ -1291,6 +1358,33 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 log = getattr(self, log_name, None)
                 if log is not None:
                     log.appendPlainText(self.last_message)
+
+        def camera_timeout_context(self, error):
+            diagnostics_fn = getattr(self.camera, "diagnostics", None)
+            diagnostics = diagnostics_fn() if callable(diagnostics_fn) else {}
+            exposure = diagnostics.get("ExposureTime", diagnostics.get("exposure_us", self.camera.get_exposure()))
+            width = diagnostics.get("Width", "?")
+            height = diagnostics.get("Height", "?")
+            pixel_format = diagnostics.get("PixelFormat", "?")
+            trigger = diagnostics.get("TriggerMode", "?")
+            last_ms = diagnostics.get("last_frame_ms", "?")
+            failures = diagnostics.get("frames_failed", self.frame_error_count)
+            likely = []
+            message = str(error).lower()
+            if "timed out" in message or "timeout" in message:
+                likely.append("相机在 SDK 等待时间内没有返回完整帧")
+            if self.auto_exposure_check.isChecked():
+                likely.append("预览自动曝光可能正在改变曝光时间")
+            if float(self.camera.get_exposure()) > 50_000:
+                likely.append("当前曝光较长，单帧等待时间会变长")
+            likely.append("USB/网口带宽、线缆、相机被其他程序占用或刚重连后未稳定也会导致超时")
+            return (
+                f"Preview frame failed; retrying in {PREVIEW_FRAME_ERROR_BACKOFF_SEC:.0f}s. "
+                f"camera={diagnostics.get('camera_id', '?')}, exposure={exposure} us, "
+                f"size={width}x{height}, pixel={pixel_format}, trigger={trigger}, "
+                f"last_wait={last_ms} ms, failures={failures}. "
+                f"Likely: {'; '.join(likely)}"
+            )
 
         def update_sim_camera_site(self):
             if isinstance(self.camera, SimCameraController):
@@ -1775,11 +1869,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.auto_stop_requested = False
             self.stop_acquisition_event.clear()
             self.set_auto_scan_button_state("running")
+            self.pause_preview_for_auto_scan()
             if config is None:
                 try:
                     config = self.auto_scan_config()
                 except Exception as exc:
                     self.auto_job_running = False
+                    self.resume_preview_after_auto_scan()
                     if not self.auto_monitoring:
                         self.set_auto_scan_button_state("idle")
                     self.log_msg(f"Auto scan config invalid: {exc}")
@@ -1923,6 +2019,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                                 metric=config["auto_exposure_mode"],
                                 max_exposure_us=config["auto_exposure_max_us"],
                             )
+                    with self.camera_lock:
+                        capture_exposure_us = float(self.camera.get_exposure())
 
                     uv_frames = []
                     capture_start = time.time()
@@ -1931,6 +2029,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             self.polarizer.move_absolute(angle)
                         time.sleep(0.05)
                         with self.camera_lock:
+                            self.camera.set_exposure(capture_exposure_us)
                             self.update_sim_camera_site()
                             frame = self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
                         uv_frames.append(np.asarray(frame, dtype=np.uint16))
@@ -1959,7 +2058,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     uvimg = aq.create_group("UV Image Data")
                     uv_stack = np.stack(uv_frames, axis=0)
                     uvimg.create_dataset("UV Raw Images", data=uv_stack, compression="gzip")
-                    uvimg.attrs["UV Exposure Time"] = float(self.camera.get_exposure())
+                    uvimg.attrs["UV Exposure Time"] = float(capture_exposure_us)
                     uvimg.attrs["UV Auto Exposure Enabled"] = int(config["auto_exposure"])
                     uvimg.attrs["UV Auto Exposure Metric"] = config["auto_exposure_mode"]
                     uvimg.attrs["UV Auto Exposure Info"] = "" if exposure_info is None else exposure_info
@@ -2037,6 +2136,16 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             self.executor.submit(run)
 
+        def pause_preview_for_auto_scan(self):
+            if self.timer.isActive():
+                self.resume_preview_after_scan = True
+                self.timer.stop()
+
+        def resume_preview_after_auto_scan(self):
+            if self.resume_preview_after_scan and bool(getattr(self.camera, "connected", False)):
+                self.timer.start()
+            self.resume_preview_after_scan = False
+
         def process_worker_results(self):
             while True:
                 try:
@@ -2050,9 +2159,16 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.status_pending = False
 
                 if error is not None:
-                    if kind == "auto_trigger":
+                    if kind == "frame":
+                        self.frame_error_count += 1
+                        self.camera_retry_until = time.time() + PREVIEW_FRAME_ERROR_BACKOFF_SEC
+                        self.exposure_status.setText("Preview frame timeout; retrying")
+                        if self.frame_error_count == 1 or self.frame_error_count % 5 == 0:
+                            self.log_msg(self.camera_timeout_context(error))
+                    elif kind == "auto_trigger":
                         self.auto_job_running = False
                         self.auto_stop_requested = False
+                        self.resume_preview_after_auto_scan()
                         self.set_auto_scan_button_state("running" if self.auto_monitoring else "idle")
                     elif kind == "moog_open":
                         self.set_moog_home_enabled(False)
@@ -2078,6 +2194,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
                 if kind == "frame":
                     frame, center, exposure_info = result
+                    self.frame_error_count = 0
+                    self.camera_retry_until = 0.0
                     self.last_frame = frame
                     self.last_center = center
                     self.camera_view.set_frame(frame, center)
@@ -2175,6 +2293,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     if result.get("stopped"):
                         self.queued_sun_trigger = None
                         self.auto_stop_requested = False
+                        self.resume_preview_after_auto_scan()
                         self.set_auto_scan_button_state("idle")
                         self.log_msg(
                             "Auto scan stopped: "
@@ -2202,6 +2321,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             )
                         else:
                             self.auto_stop_requested = False
+                            self.resume_preview_after_auto_scan()
                             self.set_auto_scan_button_state("running" if self.auto_monitoring else "idle")
                 elif kind == "auto_progress":
                     self.current_status = result["status"]
@@ -2437,6 +2557,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def stop_all(self):
             self.stop_acquisition_event.set()
             self.auto_stop_requested = True
+            self.resume_preview_after_scan = False
             self.set_auto_scan_button_state("stopping")
             if self.auto_monitoring:
                 self.stop_sun_monitor()
@@ -2491,6 +2612,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
         def set_manual_exposure(self, exposure_us):
             if self.auto_exposure_check.isChecked():
+                return
+            if self.auto_job_running:
+                self.log_msg("Manual exposure ignored while Auto Scan is running")
                 return
             def task():
                 with self.camera_lock:
@@ -2612,7 +2736,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             )
 
         def request_frame_update(self):
+            if self.auto_job_running:
+                return
             if self.camera_pending:
+                return
+            if time.time() < self.camera_retry_until:
                 return
             self.camera_pending = True
             self.preview_frame_counter += 1
@@ -2628,10 +2756,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.update_sim_camera_site()
                     frame = self.camera.get_frame(pan_deg, tilt_deg)
                     exposure_info = None
-                    if run_auto_exposure:
+                    if run_auto_exposure and not self.auto_job_running:
                         exposure_info = self.calculate_auto_exposure(frame)
-                        self.update_sim_camera_site()
-                        frame = self.camera.get_frame(pan_deg, tilt_deg)
                 if run_center_detection:
                     stride = max(1, int(math.ceil(max(frame.shape[:2]) / float(PREVIEW_CENTER_MAX_SIDE_PX))))
                     center_small, _ = detect_sun_center(frame[::stride, ::stride])
@@ -2800,6 +2926,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             return self.remote_status()
 
         def remote_exposure(self, auto, exposure):
+            if self.auto_job_running:
+                status = self.remote_status()
+                status["accepted"] = False
+                status["message"] = "Exposure changes are blocked while Auto Scan is running"
+                return status
             if auto is not None:
                 self.auto_exposure_check.setChecked(str(auto).lower() in ("1", "true", "yes", "on"))
             if exposure is not None:
