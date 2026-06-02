@@ -2002,6 +2002,15 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     with self.motion_lock:
                         moog_status = self.moog.move_absolute(target_pan, target_tilt)
                         self.current_status = moog_status
+                    self.result_queue.put((
+                        "auto_status",
+                        (
+                            f"Moog reached {group_name}: pan={moog_status.pan_deg:.2f}, "
+                            f"tilt={moog_status.tilt_deg:.2f}; settling "
+                            f"{MOOG_SETTLE_BEFORE_CAPTURE_SEC:.1f}s before capture"
+                        ),
+                        None,
+                    ))
                     if self.stop_acquisition_event.wait(MOOG_SETTLE_BEFORE_CAPTURE_SEC):
                         stopped = True
                         break
@@ -2332,6 +2341,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         f"Auto scan {result['group_name']} ({result['aq_num'] + 1}/{result['total']}, "
                         f"{result['acquisition_type']}), dtilt={result['dtilt']:.2f}, file={result['filepath']}"
                     )
+                elif kind == "auto_status":
+                    self.log_msg(result)
                 elif kind == "auto_preview":
                     frames = result.get("frames", [])
                     angles = result.get("angles", [])
