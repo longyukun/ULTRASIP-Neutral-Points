@@ -51,6 +51,7 @@ TILT_MIN_DEG = -90.0
 TILT_MAX_DEG = 90.0
 MOOG_RESOLUTION_DEG = 0.01
 MOOG_COMMAND_RESOLUTION_DEG = 0.1
+MOOG_SETTLE_BEFORE_CAPTURE_SEC = 2.0
 CENTERING_PAN_PROBE_DEG = MOOG_COMMAND_RESOLUTION_DEG
 CENTERING_MIN_PROBE_SHIFT_PX = 2.0
 PREVIEW_MAX_SIDE_PX = 720
@@ -1980,6 +1981,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["UV Image Height [px]"] = UV_IMAGE_HEIGHT_PX
                 meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
                 meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
+                meas.attrs["Moog Settle Before Capture [s]"] = MOOG_SETTLE_BEFORE_CAPTURE_SEC
 
                 for plan_index, acquisition in enumerate(acquisition_plan):
                     if self.stop_acquisition_event.is_set():
@@ -2000,6 +2002,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     with self.motion_lock:
                         moog_status = self.moog.move_absolute(target_pan, target_tilt)
                         self.current_status = moog_status
+                    if self.stop_acquisition_event.wait(MOOG_SETTLE_BEFORE_CAPTURE_SEC):
+                        stopped = True
+                        break
 
                     exposure_info = None
                     if config["auto_exposure"]:
