@@ -102,7 +102,10 @@ def moog_command_pointing(pan_deg: float, tilt_deg: float) -> Tuple[float, float
 def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) -> Tuple[float, float]:
     if suncalc_get_position is not None:
         pos = suncalc_get_position(dt, longitude_deg, latitude_deg)
-        return float(np.degrees(pos["azimuth"])), float(np.degrees(pos["altitude"]))
+        # SunCalc follows the original scripts: azimuth is south=0, west positive.
+        # Convert it to compass azimuth here so all callers use one convention.
+        compass_azimuth = (float(np.degrees(pos["azimuth"])) + 180.0) % 360.0
+        return compass_azimuth, float(np.degrees(pos["altitude"]))
 
     # NOAA-style approximation. Good enough for GUI trigger monitoring; use
     # suncalc when installed for consistency with the original acquisition code.
@@ -2830,13 +2833,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             )
             sun_pan = azimuth_to_moog_pan(sun_azimuth)
             target_pan, target_tilt = moog_command_pointing(
-                sun_pan - self.pan_offset,
-                sun_tilt - self.tilt_offset,
+                sun_pan,
+                sun_tilt,
             )
             self.log_msg(
                 "Aiming at calculated sun: "
                 f"sun az={sun_azimuth:.2f}, sun pan={sun_pan:.2f}, sun tilt={sun_tilt:.2f}, "
-                f"using pan_offset={self.pan_offset:.2f}, "
+                "using no calibration offset, "
                 f"target Moog pan={target_pan:.2f}, tilt={target_tilt:.2f}"
             )
 
