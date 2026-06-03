@@ -16,7 +16,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -52,8 +52,6 @@ TILT_MAX_DEG = 90.0
 MOOG_RESOLUTION_DEG = 0.01
 MOOG_COMMAND_RESOLUTION_DEG = 0.1
 MOOG_SETTLE_BEFORE_CAPTURE_SEC = 2.0
-CENTERING_PAN_PROBE_DEG = MOOG_COMMAND_RESOLUTION_DEG
-CENTERING_MIN_PROBE_SHIFT_PX = 2.0
 PREVIEW_MAX_SIDE_PX = 720
 PREVIEW_CENTER_MAX_SIDE_PX = 900
 PREVIEW_CENTER_DETECT_INTERVAL = 3
@@ -1208,6 +1206,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.deg_per_pixel.setDecimals(6)
             self.deg_per_pixel.setValue(UV_DEG_PER_PIXEL)
             self.deg_per_pixel.setSingleStep(0.0001)
+            self.pan_positive_moves_right_check = QtWidgets.QCheckBox("+Pan moves sun right")
+            self.pan_positive_moves_right_check.setChecked(False)
             self.aim_sun_btn = QtWidgets.QPushButton("Aim at calculated sun")
             self.aim_sun_btn.setEnabled(False)
             self.aim_sun_btn.clicked.connect(self.aim_at_calculated_sun)
@@ -1215,8 +1215,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.center_btn.clicked.connect(self.center_sun)
             center_layout.addWidget(QtWidgets.QLabel("Deg per pixel"), 0, 0)
             center_layout.addWidget(self.deg_per_pixel, 0, 1)
-            center_layout.addWidget(self.aim_sun_btn, 1, 0, 1, 2)
-            center_layout.addWidget(self.center_btn, 2, 0, 1, 2)
+            center_layout.addWidget(self.pan_positive_moves_right_check, 1, 0, 1, 2)
+            center_layout.addWidget(self.aim_sun_btn, 2, 0, 1, 2)
+            center_layout.addWidget(self.center_btn, 3, 0, 1, 2)
 
             status_group = QtWidgets.QGroupBox("Pointing")
             status_layout = QtWidgets.QVBoxLayout(status_group)
@@ -1991,7 +1992,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     group_name = acquisition["group_name"]
                     dtilt = float(acquisition["dtilt"])
                     acquisition_kind = acquisition["kind"]
-                    dt = datetime.now()
+                    dt = datetime.now().astimezone()
+                    utc_dt = dt.astimezone(timezone.utc)
                     sun_azimuth, sun_altitude = solar_position_deg(dt, config["latitude"], config["longitude"])
                     pan = azimuth_to_moog_pan(sun_azimuth)
                     tilt = sun_altitude + float(dtilt)
@@ -2055,6 +2057,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         aq.attrs["Calibration Direction"] = "up" if dtilt > 0 else "down" if dtilt < 0 else "center"
                         aq.attrs["Calibration Step Magnitude [deg]"] = abs(float(dtilt))
                     aq.attrs["Timestamp Local"] = dt.strftime("%H_%M_%S")
+                    aq.attrs["Timestamp Local New"] = dt.isoformat(timespec="microseconds")
+                    aq.attrs["Timestamp UTC New"] = utc_dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+                    aq.attrs["Timestamp Local Time Zone New"] = dt.tzname() or ""
+                    aq.attrs["Timestamp Local UTC Offset New"] = dt.strftime("%z")
                     aq.attrs["Pan"] = pan
                     aq.attrs["Tilt"] = tilt
                     aq.attrs["Pan Offset"] = config["pan_offset"]
@@ -2287,7 +2293,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             f"pan_offset={result['pan_offset_deg']:.2f}, "
                             f"tilt={result['centered_tilt_deg']:.2f}, "
                             f"correction dpan={result['applied_dpan_deg']:.4f}, dtilt={result['applied_dtilt_deg']:.4f}, "
-                            f"pan response={result['pan_pixels_per_degree']:+.2f} px/deg"
+                            f"pan direction={result['pan_direction']}"
                         )
                     else:
                         self.log_msg(self.center_failure_message(result.get("info", {})))
@@ -2875,7 +2881,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.submit_worker("polarizer", task)
 
         def center_sun(self):
-            self.log_msg("Center sun requested: searching current camera frame")
+            pan_direction = (
+                "+pan moves sun right"
+                if self.pan_positive_moves_right_check.isChecked()
+                else "+pan moves sun left"
+            )
+            self.log_msg(f"Center sun requested: searching current camera frame; pan direction={pan_direction}")
             self.remote_center()
             self.apply_status()
 
@@ -2913,6 +2924,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "auto_exposure_max_us": float(self.auto_exposure_max_us),
                 "polarizer_angle_deg": float(getattr(self.polarizer, "angle_deg", 0.0)),
                 "deg_per_pixel": self.deg_per_pixel.value(),
+                "center_pan_positive_moves_right": bool(self.pan_positive_moves_right_check.isChecked()),
                 "last_center": self.last_center_result,
             }
 
@@ -2954,6 +2966,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
         def remote_center(self):
             deg_per_pixel = self.deg_per_pixel.value()
+            pan_positive_moves_right = bool(self.pan_positive_moves_right_check.isChecked())
             latitude = self.latitude_input.value()
             longitude = self.longitude_input.value()
 
@@ -2978,55 +2991,14 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 dx = cx - width / 2.0
                 dy = cy - height / 2.0
                 dtilt = -dy * deg_per_pixel
-                pan_probe_deg = CENTERING_PAN_PROBE_DEG
-                if initial_pan_deg + pan_probe_deg > PAN_MAX_DEG:
-                    pan_probe_deg = -CENTERING_PAN_PROBE_DEG
-
-                with self.motion_lock:
-                    probe_status = self.moog.move_absolute(
-                        initial_pan_deg + pan_probe_deg,
-                        initial_tilt_deg,
-                    )
-                    self.current_status = probe_status
-                    applied_probe_deg = float(probe_status.pan_deg) - initial_pan_deg
-                if abs(applied_probe_deg) < MOOG_COMMAND_RESOLUTION_DEG / 2.0:
-                    with self.motion_lock:
-                        self.current_status = self.moog.move_absolute(initial_pan_deg, initial_tilt_deg)
-                    return {
-                        "ok": False,
-                        "info": {"reason": "pan probe failed", "detail": "pan probe movement was clamped"},
-                    }
-
-                probe_center = None
-                probe_info = {}
-                try:
-                    with self.camera_lock:
-                        self.update_sim_camera_site()
-                        probe_frame = self.camera.get_frame(probe_status.pan_deg, probe_status.tilt_deg)
-                    probe_center, probe_info = detect_sun_center(probe_frame)
-                finally:
-                    with self.motion_lock:
-                        restored_status = self.moog.move_absolute(initial_pan_deg, initial_tilt_deg)
-                        self.current_status = restored_status
-                if probe_center is None:
-                    return {"ok": False, "info": {"reason": "pan probe failed", "detail": str(probe_info)}}
-
-                pan_probe_shift_px = probe_center[0] - cx
-                if abs(pan_probe_shift_px) < CENTERING_MIN_PROBE_SHIFT_PX:
-                    return {
-                        "ok": False,
-                        "info": {
-                            "reason": "pan probe failed",
-                            "detail": f"image shift={pan_probe_shift_px:.2f} px",
-                        },
-                    }
-                pan_pixels_per_degree = pan_probe_shift_px / applied_probe_deg
+                pan_pixels_per_degree = (1.0 if pan_positive_moves_right else -1.0) / deg_per_pixel
                 dpan = -dx / pan_pixels_per_degree
+                pan_direction = "+pan moves sun right" if pan_positive_moves_right else "+pan moves sun left"
 
                 with self.motion_lock:
                     centered_status = self.moog.move_absolute(
-                        restored_status.pan_deg + dpan,
-                        restored_status.tilt_deg + dtilt,
+                        initial_pan_deg + dpan,
+                        initial_tilt_deg + dtilt,
                     )
                     self.current_status = centered_status
                 centered_dt = datetime.now()
@@ -3046,9 +3018,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     "pixel_error_y": dy,
                     "applied_dpan_deg": dpan,
                     "applied_dtilt_deg": dtilt,
-                    "pan_probe_deg": applied_probe_deg,
-                    "pan_probe_shift_px": pan_probe_shift_px,
                     "pan_pixels_per_degree": pan_pixels_per_degree,
+                    "pan_direction": pan_direction,
                     "centered_pan_deg": centered_status.pan_deg,
                     "centered_tilt_deg": centered_status.tilt_deg,
                     "sun_azimuth_deg": sun_azimuth,
