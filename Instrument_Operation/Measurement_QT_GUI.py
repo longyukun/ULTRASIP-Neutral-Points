@@ -1979,7 +1979,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             initial_dt = datetime.now().astimezone()
             _, initial_sun_altitude = solar_position_deg(initial_dt, config["latitude"], config["longitude"])
             initial_sza = 90.0 - float(initial_sun_altitude)
-            end_dtilt = 88.0 - initial_sza
+            initial_tilt_base = 90.0 - initial_sza
+            end_dtilt = 88.0 - initial_tilt_base
             if end_dtilt <= config["start_tilt"]:
                 dtilts = np.array([], dtype=float)
             else:
@@ -2029,10 +2030,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Trigger Timestamp"] = trigger_dt.isoformat(timespec="seconds")
                 meas.attrs["Scan Initial Sun Altitude [deg]"] = float(initial_sun_altitude)
                 meas.attrs["Scan Initial SZA [deg]"] = float(initial_sza)
-                meas.attrs["Scan Tilt Mode"] = "initial_sza_plus_delta_tilt"
+                meas.attrs["Scan Initial Tilt Base [deg]"] = float(initial_tilt_base)
+                meas.attrs["Scan Tilt Mode"] = "initial_sun_altitude_plus_delta_tilt"
                 meas.attrs["Scan Start Tilt [deg]"] = float(config["start_tilt"])
                 meas.attrs["Scan Start Delta Tilt [deg]"] = float(config["start_tilt"])
-                meas.attrs["Scan Computed End Tilt [deg]"] = float(initial_sza + end_dtilt)
+                meas.attrs["Scan Computed End Tilt [deg]"] = float(initial_tilt_base + end_dtilt)
                 meas.attrs["Scan Computed End Delta Tilt [deg]"] = float(end_dtilt)
                 meas.attrs["Scan Step Tilt [deg]"] = float(config["step_tilt"])
                 meas.attrs["Calibration Delta Tilts [deg]"] = np.array(CALIBRATION_DTILTS_DEG, dtype=float)
@@ -2064,7 +2066,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     utc_dt = dt.astimezone(timezone.utc)
                     sun_azimuth, sun_altitude = solar_position_deg(dt, config["latitude"], config["longitude"])
                     pan = azimuth_to_moog_pan(sun_azimuth)
-                    tilt = initial_sza + float(dtilt)
+                    tilt = initial_tilt_base + float(dtilt)
                     requested_pan = pan - config["pan_offset"]
                     requested_tilt = tilt - config["tilt_offset"]
                     target_pan, target_tilt = moog_command_pointing(requested_pan, requested_tilt)
@@ -2156,8 +2158,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     aq.attrs["Pan Offset"] = config["pan_offset"]
                     aq.attrs["Tilt Offset"] = config["tilt_offset"]
                     aq.attrs["Delta Tilt From Sun [deg]"] = float(dtilt)
-                    aq.attrs["Delta Tilt From Initial SZA [deg]"] = float(dtilt)
+                    aq.attrs["Delta Tilt From Initial Sun Altitude [deg]"] = float(dtilt)
                     aq.attrs["Initial SZA [deg]"] = float(initial_sza)
+                    aq.attrs["Initial Sun Altitude [deg]"] = float(initial_sun_altitude)
+                    aq.attrs["Initial Tilt Base [deg]"] = float(initial_tilt_base)
                     aq.attrs["Sun Position Azimuth"] = sun_azimuth
                     aq.attrs["Sun Position Altitude"] = sun_altitude
                     aq.attrs["Sun Position SZA"] = 90.0 - float(sun_altitude)
