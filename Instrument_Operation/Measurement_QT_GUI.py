@@ -2091,6 +2091,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
                 meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
                 meas.attrs["Moog Settle Before Capture [s]"] = MOOG_SETTLE_BEFORE_CAPTURE_SEC
+                meas.attrs["Zenith Wait Between Groups Enabled"] = int(scan_order == "zenith_to_sun")
+                meas.attrs["Zenith Wait Tilt [deg]"] = float(initial_tilt_base + end_dtilt)
 
                 for plan_index, acquisition in enumerate(acquisition_plan):
                     if self.stop_acquisition_event.is_set():
@@ -2273,6 +2275,34 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         },
                         None,
                     ))
+
+                    if scan_order == "zenith_to_sun" and plan_index < len(acquisition_plan) - 1:
+                        wait_dt = datetime.now().astimezone()
+                        wait_sun_azimuth, _ = solar_position_deg(
+                            wait_dt,
+                            config["latitude"],
+                            config["longitude"],
+                        )
+                        wait_pan = azimuth_to_moog_pan(wait_sun_azimuth)
+                        wait_tilt = initial_tilt_base + end_dtilt
+                        wait_target_pan, wait_target_tilt = moog_command_pointing(
+                            wait_pan - config["pan_offset"],
+                            wait_tilt - config["tilt_offset"],
+                        )
+                        with self.motion_lock:
+                            wait_status = self.moog.move_absolute(wait_target_pan, wait_target_tilt)
+                            self.current_status = wait_status
+                        self.result_queue.put((
+                            "auto_status",
+                            (
+                                f"Moved to zenith wait after {group_name}: "
+                                f"pan={wait_status.pan_deg:.2f}, tilt={wait_status.tilt_deg:.2f}"
+                            ),
+                            None,
+                        ))
+                        if self.stop_acquisition_event.is_set():
+                            stopped = True
+                            break
 
                 if self.stop_acquisition_event.is_set():
                     stopped = True
