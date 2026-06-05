@@ -982,6 +982,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.pan_offset = 0.0
             self.tilt_offset = 0.0
             self.auto_scan_auto_exposure_enabled = True
+            self.scan_order = "zenith_to_sun"
             self.auto_exposure_mode = "median"
             self.auto_exposure_max_us = AUTO_EXPOSURE_MAX_US
             self.calibration_complete = False
@@ -1523,6 +1524,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "auto_scan_auto_exposure_enabled": bool(self.auto_scan_auto_exposure_enabled),
                 "auto_exposure_mode": self.auto_exposure_mode,
                 "auto_exposure_max_us": self.auto_exposure_max_us,
+                "scan_order": self.scan_order,
             }
 
         def apply_auto_scan_settings_payload(self, settings):
@@ -1551,6 +1553,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             if "tilt_offset" in settings:
                 self.tilt_offset = quantize_pointing(settings["tilt_offset"])
             self.auto_scan_auto_exposure_enabled = bool(settings.get("auto_scan_auto_exposure_enabled", True))
+            self.scan_order = str(settings.get("scan_order", "zenith_to_sun"))
+            if self.scan_order not in ("sun_to_zenith", "zenith_to_sun"):
+                self.scan_order = "zenith_to_sun"
             if "auto_exposure_mode" in settings:
                 self.auto_exposure_mode = str(settings["auto_exposure_mode"]).lower()
                 if self.auto_exposure_mode not in ("median", "max"):
@@ -1587,7 +1592,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.settings_summary_label.setText(
                 "Location={location}, output={output}\n"
                 "Sun trigger={sun_trigger}; targets {start:.1f}-{end:.1f} deg step {step:.1f}, tol {tol:.2f}, check {interval:d}s\n"
-                "Offsets pan={pan_offset:.2f}, tilt={tilt_offset:.2f}; scan dtilt start {tilt_start:.1f}, step {tilt_step:.1f}\n"
+                "Offsets pan={pan_offset:.2f}, tilt={tilt_offset:.2f}; scan {scan_order}, dtilt start {tilt_start:.1f}, step {tilt_step:.1f}\n"
                 "Auto exposure: {auto_enabled}, {metric}, min {min_exp:.0f} us, max {max_exp:.0f} us; Polarizer={angles}".format(
                     location=self.location_input.text().strip() or "ULTRASIP",
                     output=self.output_dir_input.text().strip() or os.getcwd(),
@@ -1599,6 +1604,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     interval=self.check_interval_input.value(),
                     pan_offset=self.pan_offset,
                     tilt_offset=self.tilt_offset,
+                    scan_order="zenith-to-sun" if self.scan_order == "zenith_to_sun" else "sun-to-zenith",
                     tilt_start=self.start_tilt_input.value(),
                     tilt_step=self.scan_step_tilt_input.value(),
                     auto_enabled="ON" if self.auto_scan_auto_exposure_enabled else "OFF",
@@ -1667,17 +1673,26 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             add_double(10, "start_tilt", "Scan start tilt offset [deg]", self.start_tilt_input, 0.0, 90.0, 1, 0.1)
             add_double(11, "scan_step_tilt", "Scan step tilt [deg]", self.scan_step_tilt_input, 0.1, 20.0, 1, 0.1)
 
+            scan_order = QtWidgets.QComboBox()
+            scan_order.addItem("Zenith to sun", "zenith_to_sun")
+            scan_order.addItem("Sun to zenith", "sun_to_zenith")
+            order_index = scan_order.findData(self.scan_order)
+            scan_order.setCurrentIndex(max(0, order_index))
+            layout.addWidget(QtWidgets.QLabel("Scan order"), 12, 0)
+            layout.addWidget(scan_order, 12, 1)
+            fields["scan_order"] = scan_order
+
             auto_exposure_enabled = make_switch("Auto Exposure")
             auto_exposure_enabled.setChecked(bool(self.auto_scan_auto_exposure_enabled))
-            layout.addWidget(QtWidgets.QLabel("Auto exposure"), 12, 0)
-            layout.addWidget(auto_exposure_enabled, 12, 1)
+            layout.addWidget(QtWidgets.QLabel("Auto exposure"), 13, 0)
+            layout.addWidget(auto_exposure_enabled, 13, 1)
             fields["auto_scan_auto_exposure_enabled"] = auto_exposure_enabled
 
             auto_exposure_mode = QtWidgets.QComboBox()
             auto_exposure_mode.addItems(["Median", "Max"])
             auto_exposure_mode.setCurrentText(self.auto_exposure_mode.title())
-            layout.addWidget(QtWidgets.QLabel("Auto exposure metric"), 13, 0)
-            layout.addWidget(auto_exposure_mode, 13, 1)
+            layout.addWidget(QtWidgets.QLabel("Auto exposure metric"), 14, 0)
+            layout.addWidget(auto_exposure_mode, 14, 1)
             fields["auto_exposure_mode"] = auto_exposure_mode
 
             auto_exposure_max = QtWidgets.QDoubleSpinBox()
@@ -1685,18 +1700,18 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_exposure_max.setDecimals(0)
             auto_exposure_max.setSingleStep(10_000.0)
             auto_exposure_max.setValue(self.auto_exposure_max_us)
-            layout.addWidget(QtWidgets.QLabel("Max exposure [us]"), 14, 0)
-            layout.addWidget(auto_exposure_max, 14, 1)
+            layout.addWidget(QtWidgets.QLabel("Max exposure [us]"), 15, 0)
+            layout.addWidget(auto_exposure_max, 15, 1)
             fields["auto_exposure_max_us"] = auto_exposure_max
 
             polarizer_angles = QtWidgets.QLineEdit(self.polarizer_angles_input.text())
-            layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), 15, 0)
-            layout.addWidget(polarizer_angles, 15, 1)
+            layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), 16, 0)
+            layout.addWidget(polarizer_angles, 16, 1)
             fields["polarizer_angles"] = polarizer_angles
 
             location = QtWidgets.QLineEdit(self.location_input.text())
-            layout.addWidget(QtWidgets.QLabel("Location"), 16, 0)
-            layout.addWidget(location, 16, 1)
+            layout.addWidget(QtWidgets.QLabel("Location"), 17, 0)
+            layout.addWidget(location, 17, 1)
             fields["location"] = location
 
             output_dir = QtWidgets.QLineEdit(self.output_dir_input.text())
@@ -1709,13 +1724,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             output_row = QtWidgets.QHBoxLayout()
             output_row.addWidget(output_dir)
             output_row.addWidget(browse)
-            layout.addWidget(QtWidgets.QLabel("Output folder"), 17, 0)
-            layout.addLayout(output_row, 17, 1)
+            layout.addWidget(QtWidgets.QLabel("Output folder"), 18, 0)
+            layout.addLayout(output_row, 18, 1)
             fields["output_dir"] = output_dir
 
             dialog_buttons = getattr(QtWidgets.QDialogButtonBox, "StandardButton", QtWidgets.QDialogButtonBox)
             buttons = QtWidgets.QDialogButtonBox(dialog_buttons.Save | dialog_buttons.Cancel)
-            layout.addWidget(buttons, 18, 0, 1, 2)
+            layout.addWidget(buttons, 19, 0, 1, 2)
 
             def save_and_close():
                 try:
@@ -1737,6 +1752,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.tilt_offset = quantize_pointing(fields["tilt_offset"].value())
                     self.start_tilt_input.setValue(fields["start_tilt"].value())
                     self.scan_step_tilt_input.setValue(fields["scan_step_tilt"].value())
+                    self.scan_order = str(fields["scan_order"].currentData())
                     self.auto_scan_auto_exposure_enabled = bool(fields["auto_scan_auto_exposure_enabled"].isChecked())
                     self.set_auto_exposure_mode(fields["auto_exposure_mode"].currentText())
                     self.set_auto_exposure_max(fields["auto_exposure_max_us"].value())
@@ -1802,6 +1818,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "target_median": self.target_median.value(),
                 "auto_exposure_mode": self.auto_exposure_mode,
                 "auto_exposure_max_us": self.auto_exposure_max_us,
+                "scan_order": self.scan_order,
             }
 
         def run_auto_scan_now(self):
@@ -1989,28 +2006,36 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             if end_dtilt > 0.0 and not any(abs(dtilt) < 1e-9 for dtilt in normal_dtilts):
                 normal_dtilts.insert(0, 0.0)
 
-            acquisition_plan = []
-            if normal_dtilts:
-                acquisition_plan.append({
-                    "group_name": "Aquistion_0",
-                    "dtilt": normal_dtilts[0],
+            normal_acquisition_plan = [
+                {
+                    "group_name": f"Aquistion_{normal_index}",
+                    "dtilt": float(dtilt),
                     "kind": "normal",
-                    "normal_index": 0,
-                })
-                for calibration_index, calibration_dtilt in enumerate(CALIBRATION_DTILTS_DEG):
-                    acquisition_plan.append({
-                        "group_name": acquisition_group_name_for_dtilt("calibration_acqui", calibration_dtilt),
-                        "dtilt": float(calibration_dtilt),
-                        "kind": "calibration",
-                        "calibration_index": calibration_index,
-                    })
-                for normal_index, dtilt in enumerate(normal_dtilts[1:], start=1):
-                    acquisition_plan.append({
-                        "group_name": f"Aquistion_{normal_index}",
-                        "dtilt": float(dtilt),
-                        "kind": "normal",
-                        "normal_index": normal_index,
-                    })
+                    "normal_index": normal_index,
+                }
+                for normal_index, dtilt in enumerate(normal_dtilts)
+            ]
+            calibration_plan = [
+                {
+                    "group_name": acquisition_group_name_for_dtilt("calibration_acqui", calibration_dtilt),
+                    "dtilt": float(calibration_dtilt),
+                    "kind": "calibration",
+                    "calibration_index": calibration_index,
+                }
+                for calibration_index, calibration_dtilt in enumerate(CALIBRATION_DTILTS_DEG)
+            ]
+            scan_order = config.get("scan_order", "zenith_to_sun")
+            if scan_order == "zenith_to_sun":
+                acquisition_plan = []
+                if normal_acquisition_plan:
+                    acquisition_plan.extend(reversed(normal_acquisition_plan))
+                    acquisition_plan.extend(calibration_plan)
+            else:
+                acquisition_plan = []
+                if normal_acquisition_plan:
+                    acquisition_plan.append(normal_acquisition_plan[0])
+                    acquisition_plan.extend(calibration_plan)
+                    acquisition_plan.extend(normal_acquisition_plan[1:])
             measstart = time.time()
             acquisitions_written = 0
             normal_acquisitions_written = 0
@@ -2032,6 +2057,19 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Scan Initial SZA [deg]"] = float(initial_sza)
                 meas.attrs["Scan Initial Tilt Base [deg]"] = float(initial_tilt_base)
                 meas.attrs["Scan Tilt Mode"] = "initial_sun_altitude_plus_delta_tilt"
+                meas.attrs["Scan Order"] = scan_order
+                meas.attrs["Acquisition Numbering"] = "small_near_sun_large_near_zenith"
+                meas.attrs["Normal Acquisition Execution Order"] = np.array(
+                    [
+                        int(acquisition["normal_index"])
+                        for acquisition in acquisition_plan
+                        if acquisition["kind"] == "normal"
+                    ],
+                    dtype=int,
+                )
+                meas.attrs["Calibration Acquisition Order"] = (
+                    "after_normal_scan" if scan_order == "zenith_to_sun" else "after_acquisition_0"
+                )
                 meas.attrs["Scan Start Tilt [deg]"] = float(config["start_tilt"])
                 meas.attrs["Scan Start Delta Tilt [deg]"] = float(config["start_tilt"])
                 meas.attrs["Scan Computed End Tilt [deg]"] = float(initial_tilt_base + end_dtilt)
