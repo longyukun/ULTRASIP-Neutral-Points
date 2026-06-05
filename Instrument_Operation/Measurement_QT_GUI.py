@@ -2072,13 +2072,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     target_pan, target_tilt = moog_command_pointing(requested_pan, requested_tilt)
 
                     with self.motion_lock:
-                        moog_status = self.moog.move_absolute(target_pan, target_tilt)
-                        self.current_status = moog_status
+                        arrival_status = self.moog.move_absolute(target_pan, target_tilt)
+                        self.current_status = arrival_status
                     self.result_queue.put((
                         "auto_status",
                         (
-                            f"Moog reached {group_name}: pan={moog_status.pan_deg:.2f}, "
-                            f"tilt={moog_status.tilt_deg:.2f}; settling "
+                            f"Moog reached {group_name}: pan={arrival_status.pan_deg:.2f}, "
+                            f"tilt={arrival_status.tilt_deg:.2f}; settling "
                             f"{MOOG_SETTLE_BEFORE_CAPTURE_SEC:.1f}s before capture"
                         ),
                         None,
@@ -2086,6 +2086,17 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     if self.stop_acquisition_event.wait(MOOG_SETTLE_BEFORE_CAPTURE_SEC):
                         stopped = True
                         break
+                    with self.motion_lock:
+                        moog_status = self.moog.get_status()
+                        self.current_status = moog_status
+                    self.result_queue.put((
+                        "auto_status",
+                        (
+                            f"Pre-capture Moog actual for {group_name}: pan={moog_status.pan_deg:.2f}, "
+                            f"tilt={moog_status.tilt_deg:.2f}"
+                        ),
+                        None,
+                    ))
 
                     exposure_info = None
                     if config["auto_exposure"]:
