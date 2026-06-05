@@ -2005,6 +2005,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             normal_dtilts = [float(dtilt) for dtilt in dtilts if float(dtilt) >= 0.0]
             if end_dtilt > 0.0 and not any(abs(dtilt) < 1e-9 for dtilt in normal_dtilts):
                 normal_dtilts.insert(0, 0.0)
+            zenith_wait_dtilt = max(normal_dtilts) if normal_dtilts else 0.0
+            zenith_wait_tilt = initial_tilt_base + float(zenith_wait_dtilt)
 
             normal_acquisition_plan = [
                 {
@@ -2092,7 +2094,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
                 meas.attrs["Moog Settle Before Capture [s]"] = MOOG_SETTLE_BEFORE_CAPTURE_SEC
                 meas.attrs["Zenith Wait Between Groups Enabled"] = int(scan_order == "zenith_to_sun")
-                meas.attrs["Zenith Wait Tilt [deg]"] = float(initial_tilt_base + end_dtilt)
+                meas.attrs["Zenith Wait Delta Tilt [deg]"] = float(zenith_wait_dtilt)
+                meas.attrs["Zenith Wait Tilt [deg]"] = float(zenith_wait_tilt)
 
                 for plan_index, acquisition in enumerate(acquisition_plan):
                     if self.stop_acquisition_event.is_set():
@@ -2284,10 +2287,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             config["longitude"],
                         )
                         wait_pan = azimuth_to_moog_pan(wait_sun_azimuth)
-                        wait_tilt = initial_tilt_base + end_dtilt
                         wait_target_pan, wait_target_tilt = moog_command_pointing(
                             wait_pan - config["pan_offset"],
-                            wait_tilt - config["tilt_offset"],
+                            zenith_wait_tilt - config["tilt_offset"],
                         )
                         with self.motion_lock:
                             wait_status = self.moog.move_absolute(wait_target_pan, wait_target_tilt)
