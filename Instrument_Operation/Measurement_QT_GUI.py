@@ -72,6 +72,8 @@ AUTO_EXPOSURE_SATURATION_FRACTION = 0.97
 CAMERA_EXPOSURE_SETTLE_SEC = 0.15
 AUTO_EXPOSURE_METERING_FRAMES = 5
 UV_BIT_DEPTH = 12
+POLARIZER_POSITION_TOLERANCE_DEG = 0.05
+POLARIZER_SETTLE_AFTER_IDLE_SEC = 0.5
 DEFAULT_MOOG_PORT = "COM7"
 DEFAULT_ZABER_PORT = "COM6"
 CALIBRATION_DTILTS_DEG = (-0.5, 0.5, -1.0, 1.0, -1.5, 1.5)
@@ -82,6 +84,10 @@ def acquisition_group_name_for_dtilt(prefix: str, dtilt: float) -> str:
     magnitude = f"{abs(float(dtilt)):g}".replace(".", "p")
     return f"{prefix}_{sign}_{magnitude}"
 AUTO_SCAN_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".ultrasip_auto_scan_settings.json")
+
+
+def angular_error_deg(actual_deg: float, requested_deg: float) -> float:
+    return (float(actual_deg) - float(requested_deg) + 180.0) % 360.0 - 180.0
 
 
 def quantize_pointing(value: float) -> float:
@@ -383,6 +389,10 @@ class SimPolarizerController:
 
     def move_absolute(self, angle_deg: float):
         self.angle_deg = float(angle_deg) % 360.0
+        return self.angle_deg
+
+    def get_position(self):
+        return float(self.angle_deg)
 
 
 class RealPolarizerController:
@@ -403,6 +413,7 @@ class RealPolarizerController:
             self.axis = device.get_axis(1)
             if not self.axis.is_homed():
                 self.axis.home()
+            self.angle_deg = self.get_position()
             self.connected = True
         except Exception:
             if self.connection:
@@ -422,7 +433,14 @@ class RealPolarizerController:
             raise RuntimeError("Polarizer port is not open.")
         self.axis.move_absolute(float(angle_deg), self.units.ANGLE_DEGREES)
         self.axis.wait_until_idle()
-        self.angle_deg = float(angle_deg)
+        self.angle_deg = self.get_position()
+        return self.angle_deg
+
+    def get_position(self):
+        if not self.axis:
+            raise RuntimeError("Polarizer port is not open.")
+        self.angle_deg = float(self.axis.get_position(self.units.ANGLE_DEGREES))
+        return self.angle_deg
 
 
 class SimCameraController:
@@ -2093,6 +2111,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
                 meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
                 meas.attrs["Moog Settle Before Capture [s]"] = MOOG_SETTLE_BEFORE_CAPTURE_SEC
+                meas.attrs["Polarizer Settle After Idle [s]"] = POLARIZER_SETTLE_AFTER_IDLE_SEC
                 meas.attrs["Zenith Wait Between Groups Enabled"] = int(scan_order == "zenith_to_sun")
                 meas.attrs["Zenith Wait Delta Tilt [deg]"] = float(zenith_wait_dtilt)
                 meas.attrs["Zenith Wait Tilt [deg]"] = float(zenith_wait_tilt)
@@ -2162,6 +2181,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                                 {
                                     "frames": metering_info["frames"],
                                     "angles": metering_info["angles"],
+                                    "actual_angles": metering_info["actual_angles"],
                                     "group_name": group_name,
                                     "exposure_us": metering_info["exposure_us"],
                                     "timestamp": dt.strftime("%H:%M:%S"),
@@ -2178,12 +2198,23 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         self.update_sim_camera_site()
                         self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
 
+                    pre_capture_dt = datetime.now().astimezone()
+                    pre_capture_utc_dt = pre_capture_dt.astimezone(timezone.utc)
+                    pre_capture_sun_azimuth, pre_capture_sun_altitude = solar_position_deg(
+                        pre_capture_dt,
+                        config["latitude"],
+                        config["longitude"],
+                    )
                     uv_frames = []
+                    polarizer_requested_angles = []
+                    polarizer_actual_angles = []
                     capture_start = time.time()
                     for angle in angles:
                         with self.motion_lock:
-                            self.polarizer.move_absolute(angle)
-                        time.sleep(0.05)
+                            actual_angle = self.polarizer.move_absolute(angle)
+                        polarizer_requested_angles.append(float(angle))
+                        polarizer_actual_angles.append(float(actual_angle))
+                        time.sleep(POLARIZER_SETTLE_AFTER_IDLE_SEC)
                         with self.camera_lock:
                             self.update_sim_camera_site()
                             frame = self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
@@ -2192,6 +2223,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     with self.motion_lock:
                         post_capture_status = self.moog.get_status()
                         self.current_status = post_capture_status
+                    post_capture_dt = datetime.now().astimezone()
+                    post_capture_utc_dt = post_capture_dt.astimezone(timezone.utc)
+                    post_capture_sun_azimuth, post_capture_sun_altitude = solar_position_deg(
+                        post_capture_dt,
+                        config["latitude"],
+                        config["longitude"],
+                    )
 
                     aq = h5.create_group(group_name)
                     aq.attrs["Acquisition Type"] = acquisition_kind
@@ -2216,9 +2254,26 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     aq.attrs["Initial SZA [deg]"] = float(initial_sza)
                     aq.attrs["Initial Sun Altitude [deg]"] = float(initial_sun_altitude)
                     aq.attrs["Initial Tilt Base [deg]"] = float(initial_tilt_base)
-                    aq.attrs["Sun Position Azimuth"] = sun_azimuth
-                    aq.attrs["Sun Position Altitude"] = sun_altitude
-                    aq.attrs["Sun Position SZA"] = 90.0 - float(sun_altitude)
+                    aq.attrs["Pointing Calculation Sun Position Azimuth"] = sun_azimuth
+                    aq.attrs["Pointing Calculation Sun Position Altitude"] = sun_altitude
+                    aq.attrs["Pointing Calculation Sun Position SZA"] = 90.0 - float(sun_altitude)
+                    aq.attrs["Sun Position Azimuth"] = pre_capture_sun_azimuth
+                    aq.attrs["Sun Position Altitude"] = pre_capture_sun_altitude
+                    aq.attrs["Sun Position SZA"] = 90.0 - float(pre_capture_sun_altitude)
+                    aq.attrs["Sun Pre Capture Timestamp Local"] = pre_capture_dt.isoformat(timespec="microseconds")
+                    aq.attrs["Sun Pre Capture Timestamp UTC"] = (
+                        pre_capture_utc_dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+                    )
+                    aq.attrs["Sun Pre Capture Azimuth [deg]"] = pre_capture_sun_azimuth
+                    aq.attrs["Sun Pre Capture Altitude [deg]"] = pre_capture_sun_altitude
+                    aq.attrs["Sun Pre Capture SZA [deg]"] = 90.0 - float(pre_capture_sun_altitude)
+                    aq.attrs["Sun Post Capture Timestamp Local"] = post_capture_dt.isoformat(timespec="microseconds")
+                    aq.attrs["Sun Post Capture Timestamp UTC"] = (
+                        post_capture_utc_dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+                    )
+                    aq.attrs["Sun Post Capture Azimuth [deg]"] = post_capture_sun_azimuth
+                    aq.attrs["Sun Post Capture Altitude [deg]"] = post_capture_sun_altitude
+                    aq.attrs["Sun Post Capture SZA [deg]"] = 90.0 - float(post_capture_sun_altitude)
                     aq.attrs["Moog Requested Pan [deg]"] = requested_pan
                     aq.attrs["Moog Requested Tilt [deg]"] = requested_tilt
                     write_pointing_attrs(aq.attrs, moog_status, target_pan, target_tilt)
@@ -2241,7 +2296,30 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     uvimg.attrs["UV Bandpass"] = config["uv_wavelength"]
                     uvimg.attrs["UV Image Capture Time"] = uvmeastime
                     uvimg.attrs["UV Polarizer Angles"] = str(angles)
+                    requested_pol = np.asarray(polarizer_requested_angles, dtype=float)
+                    actual_pol = np.asarray(polarizer_actual_angles, dtype=float)
+                    pol_errors = np.asarray(
+                        [angular_error_deg(actual, requested) for actual, requested in zip(actual_pol, requested_pol)],
+                        dtype=float,
+                    )
+                    uvimg.attrs["UV Polarizer Requested Angles [deg]"] = requested_pol
+                    uvimg.attrs["UV Polarizer Actual Angles [deg]"] = actual_pol
+                    uvimg.attrs["UV Polarizer Angle Errors [deg]"] = pol_errors
+                    uvimg.attrs["UV Polarizer Position Tolerance [deg]"] = POLARIZER_POSITION_TOLERANCE_DEG
+                    polarizer_in_tolerance = bool(np.all(np.abs(pol_errors) <= POLARIZER_POSITION_TOLERANCE_DEG))
+                    uvimg.attrs["UV Polarizer Position In Tolerance"] = int(polarizer_in_tolerance)
                     uvimg.attrs["UV Image Shape"] = str(uv_stack.shape)
+                    if not polarizer_in_tolerance:
+                        self.result_queue.put((
+                            "auto_status",
+                            (
+                                f"Polarizer position warning for {group_name}: "
+                                f"requested={requested_pol.round(3).tolist()}, "
+                                f"actual={actual_pol.round(3).tolist()}, "
+                                f"errors={pol_errors.round(3).tolist()} deg"
+                            ),
+                            None,
+                        ))
                     acquisitions_written += 1
                     if acquisition_kind == "normal":
                         normal_acquisitions_written += 1
@@ -2536,6 +2614,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 elif kind == "auto_metering_preview":
                     frames = result.get("frames", [])
                     angles = result.get("angles", [])
+                    actual_angles = result.get("actual_angles", [])
                     exposure_us = float(result.get("exposure_us", float("nan")))
                     group_name = result.get("group_name", "")
                     timestamp = result.get("timestamp", "")
@@ -2544,11 +2623,14 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     for idx, label in enumerate(self.auto_preview_labels):
                         if idx < len(frames):
                             angle_text = f"{angles[idx]:g} deg" if idx < len(angles) else f"Image {idx + 1}"
+                            actual_angle_text = ""
+                            if idx < len(angles) and idx < len(actual_angles):
+                                actual_angle_text = f" actual={float(actual_angles[idx]):.2f} deg"
                             label.set_frame(
                                 frames[idx],
                                 (
                                     f"Meter {group_name}\n"
-                                    f"Pol {angle_text}, exp={exposure_us:.0f} us\n"
+                                    f"Pol {angle_text}{actual_angle_text}, exp={exposure_us:.0f} us\n"
                                     f"{timestamp}, pan={actual_pan:.2f}, tilt={actual_tilt:.2f}"
                                 ),
                                 fixed_gray=True,
@@ -2557,7 +2639,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             label.clear_frame()
                     self.log_msg(
                         f"Auto exposure metering complete for {group_name}: "
-                        f"exposure={exposure_us:.0f} us, {len(frames)} image(s)"
+                        f"exposure={exposure_us:.0f} us, {len(frames)} image(s), "
+                        f"polarizer actual={[round(float(angle), 3) for angle in actual_angles]}"
                     )
                 elif kind == "auto_preview":
                     frames = result.get("frames", [])
@@ -2880,10 +2963,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             stable_maxima = []
             preview_frames = []
             angle_values = [float(angle) for angle in angles]
+            actual_angle_values = []
             for angle in angle_values:
                 with self.motion_lock:
-                    self.polarizer.move_absolute(angle)
-                time.sleep(0.5)
+                    actual_angle = self.polarizer.move_absolute(angle)
+                actual_angle_values.append(float(actual_angle))
+                time.sleep(POLARIZER_SETTLE_AFTER_IDLE_SEC)
 
                 angle_medians = []
                 angle_maxima = []
@@ -2941,6 +3026,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             message = (
                 f"Auto exposure metering angles={','.join(f'{angle:g}' for angle in angle_values)} deg, "
+                f"actual angles={','.join(f'{angle:.2f}' for angle in actual_angle_values)} deg, "
                 f"frames/angle={AUTO_EXPOSURE_METERING_FRAMES}, "
                 f"stable medians={medians_array.astype(int).tolist()}, "
                 f"stable maxima={maxima_array.astype(int).tolist()}, metric={metric}, "
@@ -2952,6 +3038,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "exposure_us": float(new_exposure),
                 "frames": preview_frames,
                 "angles": angle_values[:len(preview_frames)],
+                "actual_angles": actual_angle_values[:len(preview_frames)],
                 "stable_medians": medians_array,
                 "stable_maxima": maxima_array,
             }
@@ -3108,8 +3195,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def set_polarizer(self, angle):
             def task():
                 with self.motion_lock:
-                    self.polarizer.move_absolute(angle)
-                return f"Polarizer angle set to {angle:g} deg"
+                    actual_angle = self.polarizer.move_absolute(angle)
+                error = angular_error_deg(actual_angle, angle)
+                status = "in tolerance" if abs(error) <= POLARIZER_POSITION_TOLERANCE_DEG else "out of tolerance"
+                return (
+                    f"Polarizer angle set to {angle:g} deg; "
+                    f"actual={actual_angle:.2f} deg, error={error:+.3f} deg ({status})"
+                )
 
             self.submit_worker("polarizer", task)
 
