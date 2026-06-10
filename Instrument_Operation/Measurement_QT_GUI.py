@@ -45,6 +45,7 @@ except ImportError:
     serial = None
 
 
+APP_VERSION = "2.1.0"
 PAN_MIN_DEG = -217.5
 PAN_MAX_DEG = 217.5
 TILT_MIN_DEG = -90.0
@@ -978,7 +979,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
     class MainWindow(QtWidgets.QMainWindow):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("ULTRASIP Auto Measurement")
+            self.setWindowTitle(f"ULTRASIP Auto Measurement v{APP_VERSION}")
             self.resize(1000, 680)
             self.setStyleSheet(
                 "QWidget { font-size: 11px; }"
@@ -1010,6 +1011,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.sun_trigger_enabled = True
             self.auto_monitoring = False
             self.auto_job_running = False
+            self.pitch_roll_running = False
             self.auto_stop_requested = False
             self.stop_acquisition_event = threading.Event()
             self.remote_server = None
@@ -1050,7 +1052,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_layout.setContentsMargins(9, 9, 9, 9)
             auto_layout.setSpacing(6)
 
-            title = QtWidgets.QLabel("ULTRASIP Auto Measurement")
+            title = QtWidgets.QLabel(f"ULTRASIP Auto Measurement v{APP_VERSION}")
             title.setStyleSheet("font: 700 18px sans-serif;")
             auto_layout.addWidget(title)
 
@@ -1161,6 +1163,24 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.output_dir_input = QtWidgets.QLineEdit(os.getcwd())
             self.browse_output_btn = QtWidgets.QPushButton("Browse")
             self.browse_output_btn.clicked.connect(self.browse_output_dir)
+
+            def make_pitch_roll_range_input(default_value):
+                widget = QtWidgets.QDoubleSpinBox()
+                widget.setRange(0.0, 20.0)
+                widget.setDecimals(2)
+                widget.setSingleStep(0.1)
+                widget.setValue(default_value)
+                return widget
+
+            self.pitch_roll_up_input = make_pitch_roll_range_input(1.0)
+            self.pitch_roll_down_input = make_pitch_roll_range_input(1.0)
+            self.pitch_roll_left_input = make_pitch_roll_range_input(1.0)
+            self.pitch_roll_right_input = make_pitch_roll_range_input(1.0)
+            self.pitch_roll_step_input = QtWidgets.QDoubleSpinBox()
+            self.pitch_roll_step_input.setRange(MOOG_COMMAND_RESOLUTION_DEG, 10.0)
+            self.pitch_roll_step_input.setDecimals(2)
+            self.pitch_roll_step_input.setSingleStep(0.1)
+            self.pitch_roll_step_input.setValue(0.5)
             self.load_auto_scan_settings()
             self.run_now_btn = QtWidgets.QPushButton()
             self.run_now_btn.clicked.connect(self.auto_scan_button_clicked)
@@ -1181,6 +1201,43 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             row += 1
             scan_layout.addWidget(self.sun_status_label, row, 0, 1, 2)
             self.update_settings_summary()
+
+            pitch_roll_group = QtWidgets.QGroupBox("Pitch/Roll Calibration Scan")
+            pitch_roll_layout = QtWidgets.QGridLayout(pitch_roll_group)
+            auto_layout.addWidget(pitch_roll_group)
+            pitch_roll_info = QtWidgets.QLabel(
+                "Aims at the sun using the calibrated pan/tilt offsets, then raster-scans a rectangle "
+                "around it row by row, capturing polarizer 0 deg images into a *_calibration.h5 file."
+            )
+            pitch_roll_info.setWordWrap(True)
+            pitch_roll_layout.addWidget(pitch_roll_info, 0, 0, 1, 4)
+            pitch_roll_layout.addWidget(QtWidgets.QLabel("Up range [deg]"), 1, 0)
+            pitch_roll_layout.addWidget(self.pitch_roll_up_input, 1, 1)
+            pitch_roll_layout.addWidget(QtWidgets.QLabel("Down range [deg]"), 1, 2)
+            pitch_roll_layout.addWidget(self.pitch_roll_down_input, 1, 3)
+            pitch_roll_layout.addWidget(QtWidgets.QLabel("Left range [deg]"), 2, 0)
+            pitch_roll_layout.addWidget(self.pitch_roll_left_input, 2, 1)
+            pitch_roll_layout.addWidget(QtWidgets.QLabel("Right range [deg]"), 2, 2)
+            pitch_roll_layout.addWidget(self.pitch_roll_right_input, 2, 3)
+            pitch_roll_layout.addWidget(QtWidgets.QLabel("Step [deg]"), 3, 0)
+            pitch_roll_layout.addWidget(self.pitch_roll_step_input, 3, 1)
+            self.pitch_roll_points_label = QtWidgets.QLabel("")
+            self.pitch_roll_points_label.setWordWrap(True)
+            pitch_roll_layout.addWidget(self.pitch_roll_points_label, 3, 2, 1, 2)
+            self.pitch_roll_btn = QtWidgets.QPushButton()
+            self.pitch_roll_btn.setMinimumHeight(28)
+            self.pitch_roll_btn.clicked.connect(self.pitch_roll_button_clicked)
+            self.set_pitch_roll_button_state("idle")
+            pitch_roll_layout.addWidget(self.pitch_roll_btn, 4, 0, 1, 4)
+            for pitch_roll_input in (
+                self.pitch_roll_up_input,
+                self.pitch_roll_down_input,
+                self.pitch_roll_left_input,
+                self.pitch_roll_right_input,
+                self.pitch_roll_step_input,
+            ):
+                pitch_roll_input.valueChanged.connect(self.update_pitch_roll_points_label)
+            self.update_pitch_roll_points_label()
 
             preview_group = QtWidgets.QGroupBox("Acquisition 0 Preview")
             preview_layout = QtWidgets.QGridLayout(preview_group)
@@ -1538,6 +1595,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "polarizer_angles": self.polarizer_angles_input.text().strip(),
                 "location": self.location_input.text().strip(),
                 "output_dir": self.output_dir_input.text().strip(),
+                "pitch_roll_up": self.pitch_roll_up_input.value(),
+                "pitch_roll_down": self.pitch_roll_down_input.value(),
+                "pitch_roll_left": self.pitch_roll_left_input.value(),
+                "pitch_roll_right": self.pitch_roll_right_input.value(),
+                "pitch_roll_step": self.pitch_roll_step_input.value(),
                 "sun_trigger_enabled": bool(self.sun_trigger_enabled),
                 "auto_scan_auto_exposure_enabled": bool(self.auto_scan_auto_exposure_enabled),
                 "auto_exposure_mode": self.auto_exposure_mode,
@@ -1556,6 +1618,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 ("check_interval", self.check_interval_input.setValue),
                 ("start_tilt", self.start_tilt_input.setValue),
                 ("scan_step_tilt", self.scan_step_tilt_input.setValue),
+                ("pitch_roll_up", self.pitch_roll_up_input.setValue),
+                ("pitch_roll_down", self.pitch_roll_down_input.setValue),
+                ("pitch_roll_left", self.pitch_roll_left_input.setValue),
+                ("pitch_roll_right", self.pitch_roll_right_input.setValue),
+                ("pitch_roll_step", self.pitch_roll_step_input.setValue),
             )
             for key, setter in setters:
                 if key in settings:
@@ -1850,6 +1917,358 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             else:
                 self.trigger_auto_measurement(None, None, None, datetime.now(), config=config)
 
+        def set_pitch_roll_button_state(self, state):
+            if state == "idle":
+                self.pitch_roll_btn.setText("Start Pitch/Roll Calibration Scan")
+                self.pitch_roll_btn.setEnabled(True)
+                self.pitch_roll_btn.setStyleSheet("background: #1d4ed8; color: white; font-weight: 700;")
+            elif state == "running":
+                self.pitch_roll_btn.setText("Stop Pitch/Roll Calibration Scan")
+                self.pitch_roll_btn.setEnabled(True)
+                self.pitch_roll_btn.setStyleSheet("background: #b91c1c; color: white; font-weight: 700;")
+            elif state == "stopping":
+                self.pitch_roll_btn.setText("Stop requested")
+                self.pitch_roll_btn.setEnabled(False)
+                self.pitch_roll_btn.setStyleSheet("background: #6b7280; color: white; font-weight: 700;")
+
+        def pitch_roll_grid_values(self):
+            step = float(self.pitch_roll_step_input.value())
+            if step < MOOG_COMMAND_RESOLUTION_DEG:
+                raise ValueError(f"Step must be at least {MOOG_COMMAND_RESOLUTION_DEG} deg")
+            up = float(self.pitch_roll_up_input.value())
+            down = float(self.pitch_roll_down_input.value())
+            left = float(self.pitch_roll_left_input.value())
+            right = float(self.pitch_roll_right_input.value())
+            tilt_count = int(math.floor((up + down) / step + 1e-9)) + 1
+            pan_count = int(math.floor((left + right) / step + 1e-9)) + 1
+            dtilts = [float(round(up - index * step, 6)) for index in range(tilt_count)]
+            dpans = [float(round(-left + index * step, 6)) for index in range(pan_count)]
+            if not dtilts or not dpans:
+                raise ValueError("Pitch/roll scan ranges produce an empty grid")
+            return dtilts, dpans
+
+        def update_pitch_roll_points_label(self):
+            try:
+                dtilts, dpans = self.pitch_roll_grid_values()
+            except Exception as exc:
+                self.pitch_roll_points_label.setText(f"Invalid grid: {exc}")
+                return
+            points = len(dtilts) * len(dpans)
+            est_minutes = points * (MOOG_SETTLE_BEFORE_CAPTURE_SEC + 3.0) / 60.0
+            self.pitch_roll_points_label.setText(
+                f"Grid: {len(dtilts)} rows x {len(dpans)} cols = {points} points (~{est_minutes:.0f} min)"
+            )
+
+        def pitch_roll_config(self):
+            dtilts, dpans = self.pitch_roll_grid_values()
+            return {
+                "latitude": self.latitude_input.value(),
+                "longitude": self.longitude_input.value(),
+                "location": self.location_input.text().strip() or "ULTRASIP",
+                "output_dir": self.output_dir_input.text().strip() or os.getcwd(),
+                "pan_offset": self.pan_offset,
+                "tilt_offset": self.tilt_offset,
+                "up": float(self.pitch_roll_up_input.value()),
+                "down": float(self.pitch_roll_down_input.value()),
+                "left": float(self.pitch_roll_left_input.value()),
+                "right": float(self.pitch_roll_right_input.value()),
+                "step": float(self.pitch_roll_step_input.value()),
+                "dtilts": dtilts,
+                "dpans": dpans,
+                "uv_wavelength": "355 FWHM 10nm",
+                "auto_exposure": bool(self.auto_scan_auto_exposure_enabled),
+                "auto_exposure_mode": self.auto_exposure_mode,
+                "auto_exposure_max_us": self.auto_exposure_max_us,
+            }
+
+        def pitch_roll_button_clicked(self):
+            if self.pitch_roll_running:
+                self.stop_acquisition_event.set()
+                self.set_pitch_roll_button_state("stopping")
+                self.log_msg("Stop pitch/roll calibration requested; current point will finish first")
+                return
+            self.run_pitch_roll_calibration_now()
+
+        def run_pitch_roll_calibration_now(self):
+            if h5py is None:
+                self.log_msg("Pitch/roll calibration failed: h5py is not installed")
+                return
+            if self.auto_job_running:
+                self.log_msg("Pitch/roll calibration not started: another scan is already running")
+                return
+            try:
+                config = self.pitch_roll_config()
+            except Exception as exc:
+                self.log_msg(f"Pitch/roll calibration config invalid: {exc}")
+                return
+            if not self.calibration_complete:
+                self.log_msg(
+                    "Warning: sun-center calibration is not marked complete; "
+                    f"using pan_offset={config['pan_offset']:.2f}, tilt_offset={config['tilt_offset']:.2f}"
+                )
+            self.save_auto_scan_settings()
+            self.auto_job_running = True
+            self.pitch_roll_running = True
+            self.auto_stop_requested = False
+            self.stop_acquisition_event.clear()
+            self.set_pitch_roll_button_state("running")
+            self.pause_preview_for_auto_scan()
+            self.log_msg(
+                "Pitch/roll calibration scan started: "
+                f"up={config['up']:.2f}, down={config['down']:.2f}, "
+                f"left={config['left']:.2f}, right={config['right']:.2f}, step={config['step']:.2f} deg, "
+                f"{len(config['dtilts'])}x{len(config['dpans'])} grid, polarizer 0 deg"
+            )
+
+            def task():
+                return self.run_pitch_roll_calibration_worker(config)
+
+            self.submit_worker("pitch_roll", task)
+
+        def run_pitch_roll_calibration_worker(self, config):
+            output_dir = config["output_dir"]
+            os.makedirs(output_dir, exist_ok=True)
+            date_dir = datetime.now().strftime("%Y_%m_%d")
+            datapath = os.path.join(output_dir, date_dir)
+            os.makedirs(datapath, exist_ok=True)
+            start_dt = datetime.now()
+            filename = (
+                f"{config['location']}_{start_dt.strftime('%Y%m%d')}_"
+                f"{start_dt.strftime('%H_%M_%S')}_calibration.h5"
+            )
+            filepath = os.path.join(datapath, filename)
+
+            dtilts = config["dtilts"]
+            dpans = config["dpans"]
+            polarizer_angle = 0.0
+            total_points = len(dtilts) * len(dpans)
+
+            with self.motion_lock:
+                self.polarizer.move_absolute(polarizer_angle)
+            time.sleep(POLARIZER_SETTLE_AFTER_IDLE_SEC)
+
+            if config["auto_exposure"]:
+                with self.camera_lock:
+                    self.camera.set_exposure(AUTO_EXPOSURE_FIXED_NEAR_SUN_US)
+                exposure_info = f"Fixed near-sun exposure: {AUTO_EXPOSURE_FIXED_NEAR_SUN_US:.0f} us"
+            else:
+                exposure_info = None
+            with self.camera_lock:
+                capture_exposure_us = float(self.camera.get_exposure())
+            time.sleep(CAMERA_EXPOSURE_SETTLE_SEC)
+
+            measstart = time.time()
+            acquisitions_written = 0
+            stopped = False
+
+            with h5py.File(filepath, "w") as h5:
+                meas = h5.create_group("Measurement_Metadata")
+                meas.attrs["Software Version"] = APP_VERSION
+                meas.attrs["Latitude"] = str(config["latitude"])
+                meas.attrs["Longitude"] = str(config["longitude"])
+                meas.attrs["Pan_Offset"] = str(config["pan_offset"])
+                meas.attrs["Tilt_Offset"] = str(config["tilt_offset"])
+                meas.attrs["Location"] = config["location"]
+                meas.attrs["Purpose"] = "Pitch/Roll pointing calibration raster scan around the sun"
+                meas.attrs["Scan Pattern"] = "row_by_row_top_to_bottom_left_to_right"
+                meas.attrs["Scan Up Range [deg]"] = float(config["up"])
+                meas.attrs["Scan Down Range [deg]"] = float(config["down"])
+                meas.attrs["Scan Left Range [deg]"] = float(config["left"])
+                meas.attrs["Scan Right Range [deg]"] = float(config["right"])
+                meas.attrs["Scan Step [deg]"] = float(config["step"])
+                meas.attrs["Scan Grid Rows"] = len(dtilts)
+                meas.attrs["Scan Grid Cols"] = len(dpans)
+                meas.attrs["Scan Grid Delta Tilts [deg]"] = np.array(dtilts, dtype=float)
+                meas.attrs["Scan Grid Delta Pans [deg]"] = np.array(dpans, dtype=float)
+                meas.attrs["Scan Sun Tracking"] = "sun_position_recomputed_at_each_grid_point"
+                meas.attrs["Polarizer Angle [deg]"] = float(polarizer_angle)
+                meas.attrs["Auto Exposure Enabled"] = int(config["auto_exposure"])
+                meas.attrs["Auto Exposure Metric"] = config["auto_exposure_mode"]
+                meas.attrs["Auto Exposure Fixed Near Sun [us]"] = AUTO_EXPOSURE_FIXED_NEAR_SUN_US
+                meas.attrs["Auto Exposure Min [us]"] = AUTO_EXPOSURE_MIN_US
+                meas.attrs["Auto Exposure Max [us]"] = float(config["auto_exposure_max_us"])
+                meas.attrs["Capture Exposure [us]"] = float(capture_exposure_us)
+                meas.attrs["UV Image Width [px]"] = UV_IMAGE_WIDTH_PX
+                meas.attrs["UV Image Height [px]"] = UV_IMAGE_HEIGHT_PX
+                meas.attrs["UV Pixel Scale [deg/pixel]"] = UV_DEG_PER_PIXEL
+                meas.attrs["Moog Command Resolution [deg]"] = MOOG_COMMAND_RESOLUTION_DEG
+                meas.attrs["Moog Settle Before Capture [s]"] = MOOG_SETTLE_BEFORE_CAPTURE_SEC
+                meas.attrs["Polarizer Settle After Idle [s]"] = POLARIZER_SETTLE_AFTER_IDLE_SEC
+
+                plan_index = 0
+                for row_index, dtilt in enumerate(dtilts):
+                    if stopped:
+                        break
+                    for col_index, dpan in enumerate(dpans):
+                        if self.stop_acquisition_event.is_set():
+                            stopped = True
+                            break
+
+                        dt = datetime.now().astimezone()
+                        utc_dt = dt.astimezone(timezone.utc)
+                        sun_azimuth, sun_altitude = solar_position_deg(dt, config["latitude"], config["longitude"])
+                        pan = azimuth_to_moog_pan(sun_azimuth) + float(dpan)
+                        tilt = float(sun_altitude) + float(dtilt)
+                        requested_pan = pan - config["pan_offset"]
+                        requested_tilt = tilt - config["tilt_offset"]
+                        target_pan, target_tilt = moog_command_pointing(requested_pan, requested_tilt)
+
+                        with self.motion_lock:
+                            arrival_status = self.moog.move_absolute(target_pan, target_tilt)
+                            self.current_status = arrival_status
+                        if self.stop_acquisition_event.wait(MOOG_SETTLE_BEFORE_CAPTURE_SEC):
+                            stopped = True
+                            break
+                        with self.motion_lock:
+                            moog_status = self.moog.get_status()
+                            self.current_status = moog_status
+                            actual_polarizer_angle = float(self.polarizer.get_position())
+
+                        pre_capture_dt = datetime.now().astimezone()
+                        pre_capture_utc_dt = pre_capture_dt.astimezone(timezone.utc)
+                        pre_capture_sun_azimuth, pre_capture_sun_altitude = solar_position_deg(
+                            pre_capture_dt,
+                            config["latitude"],
+                            config["longitude"],
+                        )
+                        capture_start = time.time()
+                        with self.camera_lock:
+                            self.update_sim_camera_site()
+                            frame = np.asarray(
+                                self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg),
+                                dtype=np.uint16,
+                            )
+                        uvmeastime = time.time() - capture_start
+                        with self.motion_lock:
+                            post_capture_status = self.moog.get_status()
+                            self.current_status = post_capture_status
+                        post_capture_dt = datetime.now().astimezone()
+                        post_capture_utc_dt = post_capture_dt.astimezone(timezone.utc)
+                        post_capture_sun_azimuth, post_capture_sun_altitude = solar_position_deg(
+                            post_capture_dt,
+                            config["latitude"],
+                            config["longitude"],
+                        )
+
+                        detected_center, center_info = detect_sun_center(frame)
+
+                        group_name = f"Calibration_{plan_index:03d}_r{row_index:02d}_c{col_index:02d}"
+                        aq = h5.create_group(group_name)
+                        aq.attrs["Acquisition Type"] = "pitch_roll_calibration"
+                        aq.attrs["Grid Index"] = int(plan_index)
+                        aq.attrs["Grid Row"] = int(row_index)
+                        aq.attrs["Grid Col"] = int(col_index)
+                        aq.attrs["Grid Delta Pan [deg]"] = float(dpan)
+                        aq.attrs["Grid Delta Tilt [deg]"] = float(dtilt)
+                        aq.attrs["Timestamp Local"] = dt.strftime("%H_%M_%S")
+                        aq.attrs["Timestamp Local New"] = dt.isoformat(timespec="microseconds")
+                        aq.attrs["Timestamp UTC New"] = utc_dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+                        aq.attrs["Timestamp Local Time Zone New"] = dt.tzname() or ""
+                        aq.attrs["Timestamp Local UTC Offset New"] = dt.strftime("%z")
+                        aq.attrs["Pan"] = pan
+                        aq.attrs["Tilt"] = tilt
+                        aq.attrs["Moog Command Tilt [deg]"] = float(tilt)
+                        aq.attrs["Pan Offset"] = config["pan_offset"]
+                        aq.attrs["Tilt Offset"] = config["tilt_offset"]
+                        aq.attrs["Delta Pan From Sun [deg]"] = float(dpan)
+                        aq.attrs["Delta Tilt From Sun [deg]"] = float(dtilt)
+                        aq.attrs["Pointing Calculation Sun Position Azimuth"] = sun_azimuth
+                        aq.attrs["Pointing Calculation Sun Position Altitude"] = sun_altitude
+                        aq.attrs["Pointing Calculation Sun Position SZA"] = 90.0 - float(sun_altitude)
+                        aq.attrs["Sun Position Azimuth"] = pre_capture_sun_azimuth
+                        aq.attrs["Sun Position Altitude"] = pre_capture_sun_altitude
+                        aq.attrs["Sun Position SZA"] = 90.0 - float(pre_capture_sun_altitude)
+                        aq.attrs["Sun Pre Capture Timestamp Local"] = pre_capture_dt.isoformat(timespec="microseconds")
+                        aq.attrs["Sun Pre Capture Timestamp UTC"] = (
+                            pre_capture_utc_dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+                        )
+                        aq.attrs["Sun Pre Capture Azimuth [deg]"] = pre_capture_sun_azimuth
+                        aq.attrs["Sun Pre Capture Altitude [deg]"] = pre_capture_sun_altitude
+                        aq.attrs["Sun Pre Capture SZA [deg]"] = 90.0 - float(pre_capture_sun_altitude)
+                        aq.attrs["Sun Post Capture Timestamp Local"] = post_capture_dt.isoformat(timespec="microseconds")
+                        aq.attrs["Sun Post Capture Timestamp UTC"] = (
+                            post_capture_utc_dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
+                        )
+                        aq.attrs["Sun Post Capture Azimuth [deg]"] = post_capture_sun_azimuth
+                        aq.attrs["Sun Post Capture Altitude [deg]"] = post_capture_sun_altitude
+                        aq.attrs["Sun Post Capture SZA [deg]"] = 90.0 - float(post_capture_sun_altitude)
+                        aq.attrs["Moog Requested Pan [deg]"] = requested_pan
+                        aq.attrs["Moog Requested Tilt [deg]"] = requested_tilt
+                        write_pointing_attrs(aq.attrs, moog_status, target_pan, target_tilt)
+                        write_post_capture_pointing_attrs(
+                            aq.attrs,
+                            post_capture_status,
+                            target_pan,
+                            target_tilt,
+                        )
+                        if detected_center is not None:
+                            aq.attrs["Detected Sun Center X [px]"] = float(detected_center[0])
+                            aq.attrs["Detected Sun Center Y [px]"] = float(detected_center[1])
+                            aq.attrs["Detected Sun Center OK"] = 1
+                        else:
+                            aq.attrs["Detected Sun Center OK"] = 0
+                        aq.attrs["Detected Sun Center Info"] = json.dumps(center_info)
+
+                        uvimg = aq.create_group("UV Image Data")
+                        uv_stack = np.stack([frame], axis=0)
+                        uvimg.create_dataset("UV Raw Images", data=uv_stack, compression="gzip")
+                        uvimg.attrs["UV Exposure Time"] = float(capture_exposure_us)
+                        uvimg.attrs["UV Auto Exposure Enabled"] = int(config["auto_exposure"])
+                        uvimg.attrs["UV Auto Exposure Metric"] = config["auto_exposure_mode"]
+                        uvimg.attrs["UV Auto Exposure Info"] = "" if exposure_info is None else exposure_info
+                        uvimg.attrs["UV Auto Exposure Min [us]"] = AUTO_EXPOSURE_MIN_US
+                        uvimg.attrs["UV Auto Exposure Max [us]"] = float(config["auto_exposure_max_us"])
+                        uvimg.attrs["UV Bandpass"] = config["uv_wavelength"]
+                        uvimg.attrs["UV Image Capture Time"] = uvmeastime
+                        uvimg.attrs["UV Polarizer Angles"] = str([polarizer_angle])
+                        requested_pol = np.asarray([polarizer_angle], dtype=float)
+                        actual_pol = np.asarray([actual_polarizer_angle], dtype=float)
+                        pol_errors = np.asarray(
+                            [angular_error_deg(actual_polarizer_angle, polarizer_angle)],
+                            dtype=float,
+                        )
+                        uvimg.attrs["UV Polarizer Requested Angles [deg]"] = requested_pol
+                        uvimg.attrs["UV Polarizer Actual Angles [deg]"] = actual_pol
+                        uvimg.attrs["UV Polarizer Angle Errors [deg]"] = pol_errors
+                        uvimg.attrs["UV Polarizer Position Tolerance [deg]"] = POLARIZER_POSITION_TOLERANCE_DEG
+                        polarizer_in_tolerance = bool(np.all(np.abs(pol_errors) <= POLARIZER_POSITION_TOLERANCE_DEG))
+                        uvimg.attrs["UV Polarizer Position In Tolerance"] = int(polarizer_in_tolerance)
+                        uvimg.attrs["UV Image Shape"] = str(uv_stack.shape)
+
+                        acquisitions_written += 1
+                        self.result_queue.put((
+                            "auto_progress",
+                            {
+                                "aq_num": plan_index,
+                                "total": total_points,
+                                "group_name": group_name,
+                                "acquisition_type": "pitch_roll_calibration",
+                                "dtilt": float(dtilt),
+                                "filepath": filepath,
+                                "status": moog_status,
+                            },
+                            None,
+                        ))
+                        plan_index += 1
+
+                if self.stop_acquisition_event.is_set():
+                    stopped = True
+                meas.attrs["Total Measurement Time"] = (time.time() - measstart) / 60.0
+                meas.attrs["Acquisition Stopped"] = int(stopped)
+                meas.attrs["Completed Acquisitions"] = acquisitions_written
+                meas.attrs["Planned Acquisitions"] = total_points
+
+            return {
+                "filepath": filepath,
+                "acquisitions": acquisitions_written,
+                "planned_acquisitions": total_points,
+                "rows": len(dtilts),
+                "cols": len(dpans),
+                "stopped": stopped,
+                "pan_offset": config["pan_offset"],
+                "tilt_offset": config["tilt_offset"],
+            }
+
         def set_sun_trigger_mode(self, checked):
             if checked:
                 self.sun_status_label.setText("Sun trigger mode enabled; press Start Auto Scan to monitor")
@@ -2064,6 +2483,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             with h5py.File(filepath, "w") as h5:
                 meas = h5.create_group("Measurement_Metadata")
+                meas.attrs["Software Version"] = APP_VERSION
                 meas.attrs["Latitude"] = str(config["latitude"])
                 meas.attrs["Longitude"] = str(config["longitude"])
                 meas.attrs["Pan_Offset"] = str(config["pan_offset"])
@@ -2449,6 +2869,12 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         self.auto_stop_requested = False
                         self.resume_preview_after_auto_scan()
                         self.set_auto_scan_button_state("running" if self.auto_monitoring else "idle")
+                    elif kind == "pitch_roll":
+                        self.auto_job_running = False
+                        self.pitch_roll_running = False
+                        self.auto_stop_requested = False
+                        self.resume_preview_after_auto_scan()
+                        self.set_pitch_roll_button_state("idle")
                     elif kind == "moog_open":
                         self.set_moog_home_enabled(False)
                         self.set_switch_pair("moog_switch", False)
@@ -2602,6 +3028,23 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             self.auto_stop_requested = False
                             self.resume_preview_after_auto_scan()
                             self.set_auto_scan_button_state("running" if self.auto_monitoring else "idle")
+                elif kind == "pitch_roll":
+                    self.auto_job_running = False
+                    self.pitch_roll_running = False
+                    self.auto_stop_requested = False
+                    self.resume_preview_after_auto_scan()
+                    self.set_pitch_roll_button_state("idle")
+                    if result.get("stopped"):
+                        self.log_msg(
+                            "Pitch/roll calibration stopped: "
+                            f"{result['acquisitions']}/{result['planned_acquisitions']} points saved to {result['filepath']}"
+                        )
+                    else:
+                        self.log_msg(
+                            "Pitch/roll calibration complete: "
+                            f"{result['acquisitions']} points ({result['rows']}x{result['cols']} grid) "
+                            f"saved to {result['filepath']}"
+                        )
                 elif kind == "auto_progress":
                     self.current_status = result["status"]
                     self.apply_status()
@@ -3378,6 +3821,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             try:
                 with h5py.File(path, "w") as h5:
                     meta = h5.create_group("Measurement_Metadata")
+                    meta.attrs["Software Version"] = APP_VERSION
                     meta.attrs["Created Local Time"] = datetime.now().isoformat(timespec="seconds")
                     meta.attrs["Mode"] = "Simulation" if self.simulation else "Hardware"
                     meta.attrs["Purpose"] = "Manual pointing calibration"
@@ -3471,7 +3915,7 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     MainWindow = build_app_classes(QtCore, QtGui, QtWidgets)
     window = MainWindow()
-    window.log_msg(f"Using {qt_api}")
+    window.log_msg(f"ULTRASIP Auto Measurement v{APP_VERSION}, using {qt_api}")
     window.show()
     if hasattr(app, "exec"):
         return app.exec()
