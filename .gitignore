@@ -1,3 +1,7 @@
-Data_Analysis_Visualization/__pycache__/pixel_metadata.cpython-310.pyc
+__pycache__/
+*.pyc
+.DS_Store
 *.npy
 *.npz
+Data_Analysis_Visualization/batch_outputs/
+Clarissa_Dissertation.pdf
