@@ -4,6 +4,8 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+
+import h5py
 import matplotlib
 matplotlib.use("QtAgg")
 import numpy as np
@@ -29,6 +31,76 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from scipy.ndimage import gaussian_filter
+
+
+DEFAULT_CIRCULAR_CROP_RADIUS_FRACTION = 0.82
+DEFAULT_CIRCULAR_CROP_RADIUS_SHRINK_PX = 100.0
+
+
+def circular_crop_radius_fraction():
+    try:
+        return float(os.environ.get(
+            "NP_CIRCULAR_CROP_RADIUS_FRACTION",
+            DEFAULT_CIRCULAR_CROP_RADIUS_FRACTION,
+        ))
+    except Exception:
+        return DEFAULT_CIRCULAR_CROP_RADIUS_FRACTION
+
+
+def circular_crop_radius_shrink_px():
+    try:
+        return float(os.environ.get(
+            "NP_CIRCULAR_CROP_RADIUS_SHRINK_PX",
+            DEFAULT_CIRCULAR_CROP_RADIUS_SHRINK_PX,
+        ))
+    except Exception:
+        return DEFAULT_CIRCULAR_CROP_RADIUS_SHRINK_PX
+
+
+def circular_crop_mask(shape):
+    radius_fraction = circular_crop_radius_fraction()
+    rows, cols = np.indices(shape)
+    center_row = (shape[0] - 1) / 2.0
+    center_col = (shape[1] - 1) / 2.0
+    radius = max(1.0, radius_fraction * min(shape) / 2.0 - circular_crop_radius_shrink_px())
+    return (rows - center_row) ** 2 + (cols - center_col) ** 2 <= radius ** 2
+
+
+def circular_crop_radius_px(shape):
+    radius = circular_crop_radius_fraction() * min(shape) / 2.0 - circular_crop_radius_shrink_px()
+    return max(1.0, float(radius))
+
+
+def circular_crop_mask_for_radius(shape, radius):
+    rows, cols = np.indices(shape)
+    center_row = (shape[0] - 1) / 2.0
+    center_col = (shape[1] - 1) / 2.0
+    return (rows - center_row) ** 2 + (cols - center_col) ** 2 <= radius ** 2
+
+
+def circular_crop_slices(shape):
+    radius = circular_crop_radius_px(shape)
+    half_width = max(1, int(np.floor(radius)))
+    center_row = (shape[0] - 1) / 2.0
+    center_col = (shape[1] - 1) / 2.0
+    row_start = max(0, int(np.floor(center_row - half_width)))
+    row_stop = min(shape[0], int(np.ceil(center_row + half_width + 1)))
+    col_start = max(0, int(np.floor(center_col - half_width)))
+    col_stop = min(shape[1], int(np.ceil(center_col + half_width + 1)))
+    return slice(row_start, row_stop), slice(col_start, col_stop), radius
+
+
+def apply_circular_crop(data, mask):
+    cropped = np.asarray(data, dtype=np.float32).copy()
+    cropped[~mask] = np.nan
+    return cropped
+
+
+def apply_center_circular_crop(*arrays):
+    row_slice, col_slice, radius = circular_crop_slices(arrays[0].shape)
+    cropped_arrays = [np.asarray(arr)[row_slice, col_slice] for arr in arrays]
+    mask = circular_crop_mask_for_radius(cropped_arrays[0].shape, radius)
+    return [apply_circular_crop(arr, mask) for arr in cropped_arrays], mask
 
 
 def acquisition_names(handle):
@@ -281,6 +353,15 @@ def load_view_geometry(uv):
     return view_zen, view_az
 
 
+def rotate_qu(q, u, theta_deg):
+    """Rotate Q/I, U/I in Stokes space by theta using R(theta) = [[cos,-sin],[sin,cos]]."""
+    theta = np.radians(theta_deg)
+    c, s = np.cos(theta), np.sin(theta)
+    q_rot = c * q + s * u
+    u_rot = -s * q + c * u
+    return q_rot, u_rot
+
+
 def load_products(handle, aq_name, sigma):
     aq = handle[aq_name]
     uv = aq["UV Image Data"]
@@ -300,6 +381,8 @@ def load_products(handle, aq_name, sigma):
     q = Q_s / np.maximum(I_s, 1e-6)
     u = U_s / np.maximum(I_s, 1e-6)
     dolp = np.sqrt(Q_s ** 2 + U_s ** 2) / np.maximum(np.abs(I_s), 1e-6)
+    (I_s, q, u, dolp, view_zen, view_az), mask = apply_center_circular_crop(
+        I_s, q, u, dolp, view_zen, view_az)
 
     return {
         "aq": aq,
@@ -310,6 +393,9 @@ def load_products(handle, aq_name, sigma):
         "log_dolp": np.log10(np.maximum(dolp, 1e-6)),
         "view_zen": view_zen,
         "view_az": view_az,
+        "crop_mask": mask,
+        "crop_radius_fraction": circular_crop_radius_fraction(),
+        "crop_radius_shrink_px": circular_crop_radius_shrink_px(),
     }
 
 
@@ -319,11 +405,11 @@ def label_angular_image_axes(ax, view_zen, view_az):
 
     def az_formatter(x_value, _position):
         col = int(np.clip(round(x_value), 0, view_az.shape[1] - 1))
-        return f"{view_az[center_row, col]:.1f}"
+        return f"{nearest_finite_1d(view_az[:, col], center_row):.1f}"
 
     def zen_formatter(y_value, _position):
         row = int(np.clip(round(y_value), 0, view_zen.shape[0] - 1))
-        return f"{view_zen[row, center_col]:.1f}"
+        return f"{nearest_finite_1d(view_zen[row, :], center_col):.1f}"
 
     ax.set_xlabel("Azimuth [deg]")
     ax.set_ylabel("Zenith [deg]")
@@ -333,17 +419,30 @@ def label_angular_image_axes(ax, view_zen, view_az):
     ax.tick_params(labelsize=7)
 
 
+def nearest_finite_1d(values, index):
+    values = np.asarray(values)
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return np.nan
+    index = int(np.clip(round(index), 0, len(values) - 1))
+    if finite[index]:
+        return float(values[index])
+    finite_indices = np.flatnonzero(finite)
+    nearest = finite_indices[np.argmin(np.abs(finite_indices - index))]
+    return float(values[nearest])
+
+
 def label_raw_image_axes(ax, view_zen, view_az):
     center_row = view_zen.shape[0] // 2
     center_col = view_zen.shape[1] // 2
 
     def az_formatter(x_value, _position):
         col = int(np.clip(round(x_value), 0, view_az.shape[1] - 1))
-        return f"{view_az[center_row, col]:.1f}"
+        return f"{nearest_finite_1d(view_az[:, col], center_row):.1f}"
 
     def zen_formatter(y_value, _position):
         row = int(np.clip(round(y_value), 0, view_zen.shape[0] - 1))
-        return f"{view_zen[row, center_col]:.1f}"
+        return f"{nearest_finite_1d(view_zen[row, :], center_col):.1f}"
 
     ax.set_xlabel("Azimuth [deg]")
     ax.set_ylabel("Zenith [deg]")
@@ -358,12 +457,12 @@ def label_flipped_image_axes(ax, view_zen, view_az):
 
     def az_formatter(x_value, _position):
         col = int(np.clip(round(x_value), 0, view_az.shape[1] - 1))
-        return f"{view_az[center_row, col]:.1f}"
+        return f"{nearest_finite_1d(view_az[:, col], center_row):.1f}"
 
     def zen_formatter(y_value, _position):
         display_row = int(np.clip(round(y_value), 0, view_zen.shape[0] - 1))
         source_row = view_zen.shape[0] - 1 - display_row
-        return f"{view_zen[source_row, center_col]:.1f}"
+        return f"{nearest_finite_1d(view_zen[source_row, :], center_col):.1f}"
 
     ax.set_xlabel("Azimuth [deg]")
     ax.set_ylabel("Zenith [deg]")
@@ -393,6 +492,10 @@ def display_np_points(row, view_zen, view_az):
     dolp_col = as_float(row, "dolp_col")
     if np.isfinite(dolp_row) and np.isfinite(dolp_col):
         az, zen = pixel_to_angle(dolp_row, dolp_col, view_zen, view_az)
+        if not np.isfinite(az):
+            az = as_float(row, "dolp_az_deg")
+        if not np.isfinite(zen):
+            zen = as_float(row, "dolp_zen_deg")
         points["dolp"] = {
             "row": dolp_row,
             "col": dolp_col,
@@ -404,6 +507,10 @@ def display_np_points(row, view_zen, view_az):
     zero_col = as_float(row, "zero_col")
     if np.isfinite(zero_row) and np.isfinite(zero_col):
         az, zen = pixel_to_angle(zero_row, zero_col, view_zen, view_az)
+        if not np.isfinite(az):
+            az = as_float(row, "zero_az_deg")
+        if not np.isfinite(zen):
+            zen = as_float(row, "zero_zen_deg")
         points["zero"] = {
             "row": zero_row,
             "col": zero_col,
@@ -550,6 +657,44 @@ def _sun_is_complete(cx, cy, width, height):
     return m <= cx <= width - m and m <= cy <= height - m
 
 
+def _finite_attr(attrs, key):
+    try:
+        value = float(attrs.get(key, np.nan))
+    except Exception:
+        value = np.nan
+    return value if np.isfinite(value) else np.nan
+
+
+def _parse_commanded_calibration_dtilt(name, attrs):
+    try:
+        dtilt = float(attrs.get("Delta Tilt From Sun [deg]", np.nan))
+    except Exception:
+        dtilt = np.nan
+    if np.isfinite(dtilt):
+        return dtilt, "Delta Tilt From Sun [deg]"
+
+    parts = name.split("_")
+    direction = parts[2] if len(parts) > 2 else "center"
+    amount_str = parts[3].replace("p", ".") if len(parts) > 3 else "0"
+    try:
+        sign = 1.0 if direction == "up" else -1.0 if direction == "down" else 0.0
+        return sign * float(amount_str), "calibration group name"
+    except Exception:
+        return np.nan, "unavailable"
+
+
+def _calibration_dtilt_from_attrs(name, aq0_attrs, attrs):
+    for key, source in (
+        ("Moog Post Capture Actual Tilt [deg]", "post-capture actual tilt"),
+        ("Moog Actual Tilt [deg]", "actual tilt"),
+    ):
+        base = _finite_attr(aq0_attrs, key)
+        current = _finite_attr(attrs, key)
+        if np.isfinite(base) and np.isfinite(current):
+            return current - base, source
+    return _parse_commanded_calibration_dtilt(name, attrs)
+
+
 def compute_calibration_tilt_correction(handle):
     """
     Estimate tilt pointing correction from calibration acquisitions' raw UV images.
@@ -562,7 +707,7 @@ def compute_calibration_tilt_correction(handle):
 
     Sign convention (positive correction):
       Sun appeared BELOW the expected position → instrument pointed too high
-      → view_zen values are too small → add correction to view_zen
+      → view_zen values are too large → subtract correction from view_zen
 
     Returns a dict with:
       correction_deg  – mean correction in degrees (nan if no usable frames)
@@ -625,21 +770,10 @@ def compute_calibration_tilt_correction(handle):
                              "cx": round(cx, 1), "cy": round(cy, 1)})
             continue
 
-        # Parse commanded dtilt
-        try:
-            dtilt = float(grp.attrs.get("Delta Tilt From Sun [deg]", np.nan))
-        except Exception:
-            dtilt = np.nan
+        dtilt, dtilt_source = _calibration_dtilt_from_attrs(name, aq0.attrs, grp.attrs)
         if not np.isfinite(dtilt):
-            parts = name.split("_")
-            direction = parts[2] if len(parts) > 2 else "center"
-            amount_str = parts[3].replace("p", ".") if len(parts) > 3 else "0"
-            try:
-                sign = 1.0 if direction == "up" else -1.0 if direction == "down" else 0.0
-                dtilt = sign * float(amount_str)
-            except Exception:
-                details.append({"name": name, "skip": "cannot parse dtilt"})
-                continue
+            details.append({"name": name, "skip": "cannot determine dtilt"})
+            continue
 
         # Solar motion correction: altitude change from Acquisition_0 to this frame
         try:
@@ -665,6 +799,7 @@ def compute_calibration_tilt_correction(handle):
         details.append({
             "name": name,
             "dtilt_cmd_deg": round(dtilt, 3),
+            "dtilt_source": dtilt_source,
             "cx_px": round(cx, 1),
             "cy_px": round(cy, 1),
             "cy_expected_px": round(cy_expected, 1),
@@ -732,44 +867,73 @@ class RobustNPQtApp(QMainWindow):
 
         self.apply_tilt_corr_check = QCheckBox("Apply tilt corr")
         self.apply_tilt_corr_check.setToolTip(
-            "Add the calibration-derived tilt correction to view_zen for all acquisitions.\n"
-            "Positive correction = instrument pointed too high → zenith values increase.")
+            "Subtract the calibration-derived tilt correction from view_zen for all acquisitions.\n"
+            "Positive correction = instrument pointed too high → zenith values decrease.")
         self.tilt_corr_label = QLabel("Tilt corr: ---")
         self.tilt_corr_label.setMinimumWidth(130)
 
-        controls = QHBoxLayout()
-        controls.addWidget(self.open_button)
-        controls.addWidget(self.run_button)
-        controls.addWidget(self.copy_jpg_button)
-        controls.addWidget(self.calibration_button)
-        controls.addWidget(self.calibration_label)
-        controls.addSpacing(12)
-        controls.addWidget(QLabel("Acquisition"))
-        controls.addWidget(self.combo, stretch=1)
-        controls.addWidget(self.prev_button)
-        controls.addWidget(self.next_button)
-        controls.addSpacing(12)
-        controls.addWidget(QLabel("NP zenith ref"))
-        controls.addWidget(self.sza_reference_combo)
-        controls.addSpacing(12)
-        controls.addWidget(QLabel("1x4 display"))
-        controls.addWidget(self.frame_display_combo)
-        controls.addSpacing(12)
-        controls.addWidget(QLabel("Stitch priority"))
-        controls.addWidget(self.stitch_priority_combo)
-        controls.addSpacing(12)
-        controls.addWidget(QLabel("Smoothing sigma"))
-        controls.addWidget(self.sigma_spin)
-        controls.addSpacing(12)
-        controls.addWidget(self.tilt_corr_label)
-        controls.addWidget(self.apply_tilt_corr_check)
+        self.apply_roll_rotation_check = QCheckBox("Apply v2 (roll + zenith/az)")
+        self.apply_roll_rotation_check.setToolTip(
+            "Apply the per-frame v2 pointing calibration (Pointing_Calibration_v2):\n"
+            " - Rotate Q/I and U/I in Stokes space by theta = 'Camera Roll v2 [deg]'\n"
+            "   using R(theta) = [[cos, -sin], [sin, cos]]\n"
+            " - Shift view_zen by 'Tilt Error v2 Pred [deg]' and view_az by\n"
+            "   'Pan_v2 [deg]' - 'Geometry Pan Used [deg]'")
+        self.roll_rotation_label = QLabel("Roll: ---")
+        self.roll_rotation_label.setMinimumWidth(110)
+
+        self.apply_v3_check = QCheckBox("Apply v3 (file calib only)")
+        self.apply_v3_check.setToolTip(
+            "Apply the per-file v3 pointing calibration (this file's own calibration\n"
+            "frames only, no cross-file sinusoid):\n"
+            " - Shift view_zen by 'Tilt Error v3 Pred [deg]'\n"
+            " - No Q/U rotation and no azimuth shift (camera_roll_v3 = 0,\n"
+            "   pan_v3 = pan_raw)")
+        self.v3_label = QLabel("v3: ---")
+        self.v3_label.setMinimumWidth(110)
+
+        controls_row1 = QHBoxLayout()
+        controls_row1.addWidget(self.open_button)
+        controls_row1.addWidget(self.run_button)
+        controls_row1.addWidget(self.copy_jpg_button)
+        controls_row1.addWidget(self.calibration_button)
+        controls_row1.addWidget(self.calibration_label)
+        controls_row1.addSpacing(12)
+        controls_row1.addWidget(QLabel("Acquisition"))
+        controls_row1.addWidget(self.combo, stretch=1)
+        controls_row1.addWidget(self.prev_button)
+        controls_row1.addWidget(self.next_button)
+        controls_row1.addSpacing(12)
+        controls_row1.addWidget(QLabel("NP zenith ref"))
+        controls_row1.addWidget(self.sza_reference_combo)
+
+        controls_row2 = QHBoxLayout()
+        controls_row2.addWidget(QLabel("1x4 display"))
+        controls_row2.addWidget(self.frame_display_combo)
+        controls_row2.addSpacing(12)
+        controls_row2.addWidget(QLabel("Stitch priority"))
+        controls_row2.addWidget(self.stitch_priority_combo)
+        controls_row2.addSpacing(12)
+        controls_row2.addWidget(QLabel("Smoothing sigma"))
+        controls_row2.addWidget(self.sigma_spin)
+        controls_row2.addSpacing(12)
+        controls_row2.addWidget(self.tilt_corr_label)
+        controls_row2.addWidget(self.apply_tilt_corr_check)
+        controls_row2.addSpacing(12)
+        controls_row2.addWidget(self.roll_rotation_label)
+        controls_row2.addWidget(self.apply_roll_rotation_check)
+        controls_row2.addSpacing(12)
+        controls_row2.addWidget(self.v3_label)
+        controls_row2.addWidget(self.apply_v3_check)
+        controls_row2.addStretch(1)
 
         self.figure = Figure(figsize=(19, 11), constrained_layout=True)
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
 
         layout = QVBoxLayout()
-        layout.addLayout(controls)
+        layout.addLayout(controls_row1)
+        layout.addLayout(controls_row2)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, stretch=1)
 
@@ -789,6 +953,10 @@ class RobustNPQtApp(QMainWindow):
         self.stitch_priority_combo.currentIndexChanged.connect(self.clear_panorama_and_redraw)
         self.sigma_spin.valueChanged.connect(self.clear_cache_and_redraw)
         self.apply_tilt_corr_check.stateChanged.connect(self.clear_cache_and_redraw)
+        self.apply_roll_rotation_check.stateChanged.connect(self.clear_cache_and_redraw)
+        self.apply_roll_rotation_check.toggled.connect(self._on_v2_toggled)
+        self.apply_v3_check.stateChanged.connect(self.clear_cache_and_redraw)
+        self.apply_v3_check.toggled.connect(self._on_v3_toggled)
 
         if initial_h5:
             self.load_h5(initial_h5)
@@ -1090,7 +1258,7 @@ class RobustNPQtApp(QMainWindow):
     def current_name(self):
         return self.combo.currentData()
 
-    def acquisition_sun_zenith(self, aq_name):
+    def acquisition_actual_solar_zenith(self, aq_name):
         if self.handle is not None and aq_name in self.handle:
             aq = self.handle[aq_name]
             sun_alt = aq.attrs.get("Sun Position Altitude", np.nan)
@@ -1105,11 +1273,37 @@ class RobustNPQtApp(QMainWindow):
         sun_zen = as_float(row, "sun_zen_for_filter_deg")
         return sun_zen if np.isfinite(sun_zen) else np.nan
 
+    def acquisition_geometry_sun_zenith(self, aq_name):
+        if self.handle is None or aq_name not in self.handle:
+            return self.acquisition_actual_solar_zenith(aq_name)
+
+        aq = self.handle[aq_name]
+        uv = aq.get("UV Image Data")
+        if uv is None or "view_zen" not in uv:
+            return self.acquisition_actual_solar_zenith(aq_name)
+
+        center = None
+        if "Measurement_Metadata" in self.handle:
+            center = self.handle["Measurement_Metadata"].attrs.get("Center Pixel (x,y)")
+        if center is None or len(center) < 2:
+            return self.acquisition_actual_solar_zenith(aq_name)
+
+        try:
+            col = int(np.clip(round(float(center[0])), 0, uv["view_zen"].shape[1] - 1))
+            row = int(np.clip(round(float(center[1])), 0, uv["view_zen"].shape[0] - 1))
+            sun_zen = float(uv["view_zen"][row, col])
+            if np.isfinite(sun_zen):
+                return sun_zen
+        except Exception:
+            pass
+        return self.acquisition_actual_solar_zenith(aq_name)
+
+    def acquisition_sun_zenith(self, aq_name):
+        return self.acquisition_actual_solar_zenith(aq_name)
+
     def acquisition_sun_zeniths(self):
         values = []
         for name in self.names:
-            if not name.startswith("Aquistion_"):
-                continue
             sun_zen = self.acquisition_sun_zenith(name)
             if np.isfinite(sun_zen):
                 values.append((name, sun_zen))
@@ -1227,7 +1421,7 @@ class RobustNPQtApp(QMainWindow):
             self.tilt_corr_label.setText(f"Tilt corr: no data (0/{total})")
 
     def _active_tilt_correction_deg(self):
-        """Return correction to add to view_zen, or 0 if not active."""
+        """Return correction to subtract from view_zen, or 0 if not active."""
         if not self.apply_tilt_corr_check.isChecked():
             return 0.0
         res = self.tilt_correction_result
@@ -1236,14 +1430,101 @@ class RobustNPQtApp(QMainWindow):
         corr = res.get("correction_deg", np.nan)
         return float(corr) if np.isfinite(corr) else 0.0
 
+    def _roll_deg(self, aq_name, version):
+        try:
+            roll = float(self.handle[aq_name].attrs.get(f"Camera Roll {version} [deg]", np.nan))
+        except Exception:
+            roll = np.nan
+        return roll
+
+    def _geometry_shift_deg(self, aq_name, version):
+        """Return (zen_shift_deg, az_shift_deg) to convert raw view_zen/view_az to vN."""
+        try:
+            attrs = self.handle[aq_name].attrs
+            zen_shift = float(attrs.get(f"Tilt Error {version} Pred [deg]", np.nan))
+            pan_vn = float(attrs.get(f"Pan_{version} [deg]", np.nan))
+            pan_raw = float(attrs.get("Geometry Pan Used [deg]", np.nan))
+        except Exception:
+            return 0.0, 0.0
+        zen_shift = zen_shift if np.isfinite(zen_shift) else 0.0
+        az_shift = (pan_vn - pan_raw) if np.isfinite(pan_vn) and np.isfinite(pan_raw) else 0.0
+        return zen_shift, az_shift
+
+    def _active_version(self):
+        """Return 'v2', 'v3', or None depending on which checkbox is active."""
+        if self.apply_roll_rotation_check.isChecked():
+            return "v2"
+        if self.apply_v3_check.isChecked():
+            return "v3"
+        return None
+
+    def _active_roll_deg(self, aq_name):
+        """Return the Q/U rotation angle theta, or 0 if not active/unavailable."""
+        version = self._active_version()
+        if version is None:
+            return 0.0
+        roll = self._roll_deg(aq_name, version)
+        return float(roll) if np.isfinite(roll) else 0.0
+
+    def _active_geometry_shift(self, aq_name):
+        version = self._active_version()
+        if version is None:
+            return 0.0, 0.0
+        return self._geometry_shift_deg(aq_name, version)
+
+    def _update_roll_rotation_label(self, aq_name):
+        roll = self._roll_deg(aq_name, "v2")
+        if np.isfinite(roll):
+            self.roll_rotation_label.setText(f"Roll: {roll:+.4f}°")
+        else:
+            self.roll_rotation_label.setText("Roll: n/a")
+        v3_zen = self._zen_shift_deg(aq_name, "v3")
+        if np.isfinite(v3_zen):
+            self.v3_label.setText(f"v3: {v3_zen:+.4f}°")
+        else:
+            self.v3_label.setText("v3: n/a")
+
+    def _zen_shift_deg(self, aq_name, version):
+        try:
+            shift = float(self.handle[aq_name].attrs.get(f"Tilt Error {version} Pred [deg]", np.nan))
+        except Exception:
+            shift = np.nan
+        return shift
+
+    def _on_v2_toggled(self, checked):
+        if checked and self.apply_v3_check.isChecked():
+            self.apply_v3_check.blockSignals(True)
+            self.apply_v3_check.setChecked(False)
+            self.apply_v3_check.blockSignals(False)
+            self.clear_cache_and_redraw()
+
+    def _on_v3_toggled(self, checked):
+        if checked and self.apply_roll_rotation_check.isChecked():
+            self.apply_roll_rotation_check.blockSignals(True)
+            self.apply_roll_rotation_check.setChecked(False)
+            self.apply_roll_rotation_check.blockSignals(False)
+            self.clear_cache_and_redraw()
+
     def get_products(self, aq_name):
         corr = self._active_tilt_correction_deg()
-        key = (aq_name, self.sigma_spin.value(), round(corr, 6))
+        roll = self._active_roll_deg(aq_name)
+        zen_shift, az_shift = self._active_geometry_shift(aq_name)
+        key = (
+            aq_name, self.sigma_spin.value(), round(corr, 6),
+            round(roll, 6), round(zen_shift, 6), round(az_shift, 6),
+        )
         if key not in self.cache:
             products = load_products(self.handle, aq_name, self.sigma_spin.value())
             if corr != 0.0:
                 products = dict(products)
-                products["view_zen"] = products["view_zen"] + corr
+                products["view_zen"] = products["view_zen"] - corr
+            if zen_shift != 0.0 or az_shift != 0.0:
+                products = dict(products)
+                products["view_zen"] = products["view_zen"] - zen_shift
+                products["view_az"] = products["view_az"] + az_shift
+            if roll != 0.0:
+                products = dict(products)
+                products["q"], products["u"] = rotate_qu(products["q"], products["u"], roll)
             self.cache[key] = products
         return self.cache[key]
 
@@ -1257,8 +1538,9 @@ class RobustNPQtApp(QMainWindow):
         angular_steps = []
 
         for aq_name in self.names:
-            uv = self.handle[aq_name]["UV Image Data"]
-            view_zen, view_az = load_view_geometry(uv)
+            products = self.get_products(aq_name)
+            view_zen = products["view_zen"]
+            view_az = products["view_az"]
             az_sample = view_az[::step, ::step]
             zen_sample = view_zen[::step, ::step]
             finite = np.isfinite(az_sample) & np.isfinite(zen_sample)
@@ -1290,7 +1572,7 @@ class RobustNPQtApp(QMainWindow):
         u_weight = np.zeros((n_rows, n_cols), dtype=np.float64)
 
         for aq_index, aq_name in enumerate(self.names):
-            products = load_products(self.handle, aq_name, self.sigma_spin.value())
+            products = self.get_products(aq_name)
             view_az = products["view_az"][::step, ::step]
             view_zen = products["view_zen"][::step, ::step]
             row_idx = np.rint((view_zen - zen_min) / deg_step).astype(np.int64)
@@ -1581,6 +1863,7 @@ class RobustNPQtApp(QMainWindow):
         aq_name = self.current_name()
         if not aq_name:
             return
+        self._update_roll_rotation_label(aq_name)
         products = self.get_products(aq_name)
         row, selected = self.current_np(aq_name)
         q = products["q"]
@@ -1711,7 +1994,7 @@ class RobustNPQtApp(QMainWindow):
 
         sun_alt = aq.attrs.get("Sun Position Altitude", np.nan)
         sun_az = aq.attrs.get("Sun Position Azimuth", np.nan)
-        sun_zen = 90.0 - float(sun_alt) if np.isfinite(as_float({"sun_alt": sun_alt}, "sun_alt")) else np.nan
+        actual_sun_zen = self.acquisition_actual_solar_zenith(aq_name)
         sza_reference = self.selected_reference_sza()
         try:
             sun_text = f"{float(sun_alt):.3f}, {float(sun_az):.3f}"
@@ -1762,7 +2045,8 @@ class RobustNPQtApp(QMainWindow):
                     detail_lines.append(f"    {d['name']}: SKIPPED ({d['skip']})")
                 else:
                     detail_lines.append(
-                        f"    {d['name']}: dtilt={d['dtilt_cmd_deg']:+.2f}  "
+                        f"    {d['name']}: dtilt={d['dtilt_cmd_deg']:+.2f} "
+                        f"({d.get('dtilt_source', 'unknown')})  "
                         f"cy={d['cy_px']:.0f} cy_exp={d['cy_expected_px']:.0f}  "
                         f"dy={d['dy_px']:+.0f}px  "
                         f"corr@frame={d['corr_at_frame_deg']:+.4f}  "
@@ -1780,8 +2064,9 @@ class RobustNPQtApp(QMainWindow):
             aq_name,
             f"Selection: {label if label else 'not selected'} | Method best: {', '.join(method_labels) if method_labels else 'no'}",
             f"UTC: {aq.attrs.get('Timestamp UTC', '')} | Sun alt/az: {sun_text}",
-            f"Acquisition sun zenith: {sun_zen:.4f}",
+            f"Acquisition sun zenith: {actual_sun_zen:.4f}",
             f"NP zenith ref: {sza_reference['label']} | ref SZA {sza_reference['sza']:.4f} | dSZA {sza_reference['delta']:+.4f}",
+            f"Circular crop: radius fraction {products.get('crop_radius_fraction', np.nan):.3f}, shrink {products.get('crop_radius_shrink_px', np.nan):.0f}px | valid {100 * np.count_nonzero(np.isfinite(products['I'])) / products['I'].size:.1f}%",
             f"Sun zen filter: {as_float(row, 'sun_zen_for_filter_deg'):.3f} | Min sep: {as_float(row, 'min_sun_zen_separation_deg'):.3f}",
             "",
             f"Conf DoLP/Zero/Total: {as_float(row, 'dolp_confidence'):.3f} / {as_float(row, 'zero_confidence'):.3f} / {as_float(row, 'total_confidence'):.3f}",
