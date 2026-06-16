@@ -244,6 +244,15 @@ def main():
     keep_aspect  = getattr(getattr(QtCore.Qt, "AspectRatioMode", QtCore.Qt), "KeepAspectRatio")
     smooth_xform = getattr(getattr(QtCore.Qt, "TransformationMode", QtCore.Qt), "SmoothTransformation")
 
+    # ── spinbox subclasses that ignore mouse-wheel to prevent accidental edits ─
+    class NoWheelDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+        def wheelEvent(self, event):
+            event.ignore()
+
+    class NoWheelSpinBox(QtWidgets.QSpinBox):
+        def wheelEvent(self, event):
+            event.ignore()
+
     # ── clickable camera preview ───────────────────────────────────────────────
     class CameraView(QtWidgets.QLabel):
         clicked = QtCore.Signal(float, float)
@@ -397,31 +406,31 @@ def main():
             pg = QtWidgets.QGroupBox("Parameters")
             pf = QtWidgets.QFormLayout(pg)
 
-            self._pol_spin = QtWidgets.QDoubleSpinBox()
+            self._pol_spin = NoWheelDoubleSpinBox()
             self._pol_spin.setRange(0.0, 360.0); self._pol_spin.setDecimals(1)
             self._pol_spin.setValue(0.0); self._pol_spin.setSuffix(" °")
             pf.addRow("Polarizer angle:", self._pol_spin)
 
-            self._start_pan = QtWidgets.QDoubleSpinBox()
+            self._start_pan = NoWheelDoubleSpinBox()
             self._start_pan.setRange(-210.0, 210.0); self._start_pan.setDecimals(1)
             self._start_pan.setValue(-150.0); self._start_pan.setSuffix(" °")
             pf.addRow("Start pan:", self._start_pan)
 
-            self._step_pan = QtWidgets.QDoubleSpinBox()
+            self._step_pan = NoWheelDoubleSpinBox()
             self._step_pan.setRange(1.0, 90.0); self._step_pan.setDecimals(1)
             self._step_pan.setValue(30.0); self._step_pan.setSuffix(" °")
             pf.addRow("Pan step:", self._step_pan)
 
-            self._n_steps = QtWidgets.QSpinBox()
+            self._n_steps = NoWheelSpinBox()
             self._n_steps.setRange(2, 30); self._n_steps.setValue(11)
             pf.addRow("# Pan positions:", self._n_steps)
 
-            self._tilt_0 = QtWidgets.QDoubleSpinBox()
+            self._tilt_0 = NoWheelDoubleSpinBox()
             self._tilt_0.setRange(-90.0, 90.0); self._tilt_0.setDecimals(1)
             self._tilt_0.setValue(0.0); self._tilt_0.setSuffix(" °")
             pf.addRow("Nominal tilt:", self._tilt_0)
 
-            self._dither_offset_spin = QtWidgets.QDoubleSpinBox()
+            self._dither_offset_spin = NoWheelDoubleSpinBox()
             self._dither_offset_spin.setRange(0.1, 5.0)
             self._dither_offset_spin.setDecimals(2)
             self._dither_offset_spin.setValue(DEFAULT_DITHER_OFFSET_DEG)
@@ -431,7 +440,7 @@ def main():
             )
             pf.addRow("Dither offset ±N (°):", self._dither_offset_spin)
 
-            self._exposure_spin = QtWidgets.QDoubleSpinBox()
+            self._exposure_spin = NoWheelDoubleSpinBox()
             self._exposure_spin.setRange(100.0, 1_000_000.0)
             self._exposure_spin.setDecimals(0)
             self._exposure_spin.setValue(DEFAULT_EXPOSURE_US)
@@ -472,7 +481,7 @@ def main():
             self._jog_left_btn.setToolTip("Pan left (hold to repeat)")
             self._jog_right_btn = QtWidgets.QPushButton("▶▶")
             self._jog_right_btn.setToolTip("Pan right (hold to repeat)")
-            self._jog_step_spin = QtWidgets.QDoubleSpinBox()
+            self._jog_step_spin = NoWheelDoubleSpinBox()
             self._jog_step_spin.setRange(0.01, 10.0)
             self._jog_step_spin.setDecimals(2)
             self._jog_step_spin.setValue(0.5)
