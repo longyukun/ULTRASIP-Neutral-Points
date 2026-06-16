@@ -75,7 +75,7 @@ from Measurement_QT_GUI import (
 APP_TITLE = "Tilt Error Calibration"
 APP_VER   = "2.1.0"
 
-SEARCH_MARGIN_PX = 120   # extra pixels around predicted position for search window
+SEARCH_MARGIN_PX = 720   # extra pixels around predicted position for search window
 MATCH_WARN_SCORE = 0.45  # NCC score below this → yellow warning
 DITHER_SETTLE_S  = 1.2   # settle time between dither steps (seconds)
 
