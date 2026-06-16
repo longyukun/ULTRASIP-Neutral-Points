@@ -332,11 +332,13 @@ def main():
             self.moog      = RealMoogController()
             self.polarizer = RealPolarizerController()
             self.camera    = RealVmbCameraController(exposure_us=DEFAULT_EXPOSURE_US)
+            self._camera_lock = threading.Lock()   # one grab at a time
 
             self._last_frame: Optional[np.ndarray] = None
             self._template:   Optional[np.ndarray] = None
             self._target_cx:  Optional[float]      = None
             self._target_cy:  Optional[float]      = None
+            self._live_preview = False   # True while move/settle preview thread runs
 
             self._pan_points: List[PanPoint] = []
             self._running     = False
@@ -601,7 +603,12 @@ def main():
             self._start_btn.setEnabled(False)
             self._log_msg("Hardware disconnected.")
 
-        # ── preview ────────────────────────────────────────────────────────────
+        # ── camera grab (always lock-protected) ───────────────────────────────
+        def _grab_frame(self) -> np.ndarray:
+            with self._camera_lock:
+                return self.camera.get_frame()
+
+        # ── idle preview (timer-driven, only when not running) ─────────────────
         def _request_preview(self):
             if self._running or not self.camera.connected:
                 return
@@ -609,10 +616,27 @@ def main():
 
         def _fetch_preview(self):
             try:
-                frame = self.camera.get_frame()
+                frame = self._grab_frame()
                 self._sig_frame.emit(frame)
             except Exception as exc:
                 self._sig_log.emit(f"Preview: {exc}")
+
+        # ── continuous live preview during Moog moves / settle ─────────────────
+        def _start_live_preview(self):
+            self._live_preview = True
+            threading.Thread(target=self._live_preview_loop, daemon=True).start()
+
+        def _stop_live_preview(self):
+            self._live_preview = False
+
+        def _live_preview_loop(self):
+            while self._live_preview and self.camera.connected:
+                try:
+                    frame = self._grab_frame()
+                    self._sig_frame.emit(frame)
+                except Exception:
+                    pass
+                time.sleep(0.25)
 
         def _on_frame(self, frame: np.ndarray):
             self._last_frame = frame
@@ -727,13 +751,16 @@ def main():
                 )
                 self._sig_status_update(f"Moving to pan {pan_c:+.1f}°…")
 
+                self._start_live_preview()
                 try:
                     st = self.moog.move_absolute(pan_c, tilt_c)
                     self._sig_status.emit(st)
                 except Exception as exc:
+                    self._stop_live_preview()
                     self._sig_log.emit(f"Move failed: {exc}"); continue
 
                 time.sleep(MOOG_SETTLE_BEFORE_CAPTURE_SEC)
+                self._stop_live_preview()
 
                 # -- ask user to click target ---------------------------------
                 self._click_event.clear()
@@ -741,10 +768,9 @@ def main():
                 self._sig_log.emit("Waiting for user to click target…")
                 self._sig_status_update(f"Pan {idx+1}/{n_steps}  ← Click target in image")
 
-                # show a live preview while waiting
-                self._start_preview_during_wait()
+                self._start_live_preview()
                 self._click_event.wait()        # blocks until _on_image_click fires
-                self._stop_preview_during_wait()
+                self._stop_live_preview()
 
                 if not self._running:
                     break
@@ -790,9 +816,9 @@ def main():
                         self._click_event.clear()
                         self._sig_await_click.emit()
                         self._sig_log.emit("Retry: click target again…")
-                        self._start_preview_during_wait()
+                        self._start_live_preview()
                         self._click_event.wait()
-                        self._stop_preview_during_wait()
+                        self._stop_live_preview()
 
             self._sig_log.emit("All pan positions complete.")
             self._update_sinusoid_fit()
@@ -814,7 +840,7 @@ def main():
             # reference capture at nominal (pan_0, tilt_0)
             self._sig_log.emit("Capturing reference frame at nominal position…")
             try:
-                ref_frame = self.camera.get_frame()
+                ref_frame = self._grab_frame()
                 self._sig_frame.emit(ref_frame)
             except Exception as exc:
                 self._sig_log.emit(f"Reference capture failed: {exc}")
@@ -835,16 +861,19 @@ def main():
                 self._sig_status_update(
                     f"Grid {gi+1}/{len(grid)}: Δpan={dpan:+.1f}° Δtilt={dtilt:+.1f}°"
                 )
+                self._start_live_preview()
                 try:
                     st = self.moog.move_absolute(pan_c2, tilt_c2)
                     self._sig_status.emit(st)
                 except Exception as exc:
+                    self._stop_live_preview()
                     self._sig_log.emit(f"Grid move failed: {exc}"); continue
 
                 time.sleep(DITHER_SETTLE_S)
+                self._stop_live_preview()
 
                 try:
-                    frame = self.camera.get_frame()
+                    frame = self._grab_frame()
                     self._sig_frame.emit(frame)
                 except Exception as exc:
                     self._sig_log.emit(f"Capture failed: {exc}"); continue
@@ -915,31 +944,6 @@ def main():
                 else QtCore.Qt.QueuedConnection,
                 QtCore.Q_ARG(str, txt + warn),
             )
-
-        # ── preview while waiting for user click ───────────────────────────────
-        def _start_preview_during_wait(self):
-            QtCore.QMetaObject.invokeMethod(
-                self, "_preview_start_slot",
-                QtCore.Qt.ConnectionType.QueuedConnection
-                if hasattr(QtCore.Qt, "ConnectionType")
-                else QtCore.Qt.QueuedConnection,
-            )
-
-        def _stop_preview_during_wait(self):
-            QtCore.QMetaObject.invokeMethod(
-                self, "_preview_stop_slot",
-                QtCore.Qt.ConnectionType.QueuedConnection
-                if hasattr(QtCore.Qt, "ConnectionType")
-                else QtCore.Qt.QueuedConnection,
-            )
-
-        @QtCore.Slot()
-        def _preview_start_slot(self):
-            self._preview_timer.start()
-
-        @QtCore.Slot()
-        def _preview_stop_slot(self):
-            self._preview_timer.stop()
 
         # ── step result / user action ──────────────────────────────────────────
         def _on_dither_result(self, pt: PanPoint):
