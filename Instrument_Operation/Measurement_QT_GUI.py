@@ -2,9 +2,8 @@
 """
 Qt GUI for manual ULTRASIP pointing calibration.
 
-The GUI is intentionally hardware-optional. In simulation mode it can be run
-without a Moog, Zaber stage, or UV camera attached. The same UI exposes hardware
-hooks for later field use and a small HTTP API for remote control.
+The GUI drives the Moog pan/tilt, Zaber polarizer stage, and UV camera, and
+exposes a small HTTP API for remote control.
 """
 #
 import json
@@ -153,10 +152,6 @@ def azimuth_to_moog_pan(azimuth_deg: float) -> float:
     return (float(azimuth_deg) - 180.0 + 180.0) % 360.0 - 180.0
 
 
-def moog_pan_to_azimuth(pan_deg: float) -> float:
-    return (float(pan_deg) + 180.0) % 360.0
-
-
 def import_qt():
     try:
         from PySide6 import QtCore, QtGui, QtWidgets
@@ -262,40 +257,6 @@ def write_post_capture_pointing_attrs(attrs, status: PointingStatus, target_pan_
         attrs["Moog Post Capture Hard Limit Bits"] = json.dumps({"pan_cw": 0, "pan_ccw": 0, "tilt_up": 0, "tilt_down": 0})
 
 
-class SimMoogController:
-    def __init__(self):
-        self.status = PointingStatus()
-
-    def open(self, port: str):
-        self.status.connected = True
-        return self.status
-
-    def close(self):
-        self.home()
-        self.status.connected = False
-
-    def home(self):
-        current_tilt = self.status.tilt_deg
-        self.move_absolute(0.0, current_tilt)
-        return self.move_absolute(0.0, 0.0)
-
-    def move_absolute(self, pan_deg: float, tilt_deg: float):
-        pan_deg, tilt_deg = moog_command_pointing(pan_deg, tilt_deg)
-        self.status.pan_deg = pan_deg
-        self.status.tilt_deg = tilt_deg
-        self.status.move_complete = True
-        return self.status
-
-    def move_relative(self, dpan_deg: float, dtilt_deg: float):
-        return self.move_absolute(
-            self.status.pan_deg + float(dpan_deg),
-            self.status.tilt_deg + float(dtilt_deg),
-        )
-
-    def get_status(self):
-        return self.status
-
-
 class RealMoogController:
     def __init__(self):
         import moog_functions as mf
@@ -377,25 +338,6 @@ class RealMoogController:
         return self.status
 
 
-class SimPolarizerController:
-    def __init__(self):
-        self.connected = False
-        self.angle_deg = 0.0
-
-    def open(self, port: str):
-        self.connected = True
-
-    def close(self):
-        self.connected = False
-
-    def move_absolute(self, angle_deg: float):
-        self.angle_deg = float(angle_deg) % 360.0
-        return self.angle_deg
-
-    def get_position(self):
-        return float(self.angle_deg)
-
-
 class RealPolarizerController:
     def __init__(self):
         self.connection = None
@@ -442,64 +384,6 @@ class RealPolarizerController:
             raise RuntimeError("Polarizer port is not open.")
         self.angle_deg = float(self.axis.get_position(self.units.ANGLE_DEGREES))
         return self.angle_deg
-
-
-class SimCameraController:
-    def __init__(self, exposure_us: float = DEFAULT_EXPOSURE_US):
-        self.connected = False
-        self.frame_index = 0
-        self.exposure_us = float(exposure_us)
-        self.width = UV_IMAGE_WIDTH_PX
-        self.height = UV_IMAGE_HEIGHT_PX
-        self.sun_x = self.width * 0.5
-        self.sun_y = self.height * 0.5
-        self.pixels_per_degree = 1.0 / UV_DEG_PER_PIXEL
-        self.latitude_deg = 32.23134
-        self.longitude_deg = -110.94712
-        self.pan_mount_offset_deg = float(np.random.default_rng().uniform(-10.0, 10.0))
-
-    def open(self):
-        self.connected = True
-
-    def close(self):
-        self.connected = False
-
-    def set_exposure(self, exposure_us: float):
-        self.exposure_us = float(np.clip(exposure_us, AUTO_EXPOSURE_MIN_US, AUTO_EXPOSURE_MAX_US))
-
-    def get_exposure(self):
-        return self.exposure_us
-
-    def set_site(self, latitude_deg: float, longitude_deg: float):
-        self.latitude_deg = float(latitude_deg)
-        self.longitude_deg = float(longitude_deg)
-
-    def reset_mount_offset(self):
-        self.pan_mount_offset_deg = float(np.random.default_rng().uniform(-10.0, 10.0))
-
-    @staticmethod
-    def azimuth_error_deg(target_azimuth_deg: float, pointing_azimuth_deg: float):
-        return (float(target_azimuth_deg) - float(pointing_azimuth_deg) + 180.0) % 360.0 - 180.0
-
-    def get_frame(self, pan_deg: float = 0.0, tilt_deg: float = 0.0):
-        self.frame_index += 1
-        yy, xx = np.mgrid[0:self.height, 0:self.width]
-        drift_x = 22.0 * math.sin(self.frame_index / 28.0)
-        drift_y = 14.0 * math.cos(self.frame_index / 31.0)
-        sun_azimuth, sun_altitude = solar_position_deg(datetime.now(), self.latitude_deg, self.longitude_deg)
-        pointing_azimuth = moog_pan_to_azimuth(float(pan_deg) + self.pan_mount_offset_deg)
-        pan_error = self.azimuth_error_deg(sun_azimuth, pointing_azimuth)
-        tilt_error = sun_altitude - float(tilt_deg)
-        cx = self.sun_x + pan_error * self.pixels_per_degree + drift_x
-        cy = self.sun_y - tilt_error * self.pixels_per_degree + drift_y
-
-        sky = 250.0 + 20.0 * np.sin(xx / 180.0) + 10.0 * np.cos(yy / 130.0)
-        disk = 3500.0 * np.exp(-(((xx - cx) ** 2) + ((yy - cy) ** 2)) / (2 * 35.0 ** 2))
-        halo = 900.0 * np.exp(-(((xx - cx) ** 2) + ((yy - cy) ** 2)) / (2 * 105.0 ** 2))
-        noise = np.random.default_rng(self.frame_index).normal(0.0, 12.0, sky.shape)
-        exposure_scale = self.exposure_us / DEFAULT_EXPOSURE_US
-        frame = np.clip((sky + disk + halo + noise) * exposure_scale, 0, 4095).astype(np.uint16)
-        return frame
 
 
 class RealVmbCameraController:
@@ -593,7 +477,7 @@ class RealVmbCameraController:
             values["last_error"] = self.last_frame_error
         return values
 
-    def get_frame(self, pan_deg: float = 0.0, tilt_deg: float = 0.0):
+    def get_frame(self):
         if not self.connected or self.camera is None:
             raise RuntimeError("Camera is not open.")
         start = time.time()
@@ -989,10 +873,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { min-height: 20px; }"
             )
 
-            self.simulation = True
-            self.moog = SimMoogController()
-            self.polarizer = SimPolarizerController()
-            self.camera = SimCameraController()
+            self.moog = RealMoogController()
+            self.polarizer = RealPolarizerController()
+            self.camera = RealVmbCameraController()
             self.last_frame = None
             self.last_center = None
             self.last_center_result = None
@@ -1080,9 +963,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_connection_group = QtWidgets.QGroupBox("Device Control")
             auto_connection_layout = QtWidgets.QGridLayout(auto_connection_group)
             auto_layout.addWidget(auto_connection_group)
-            self.auto_sim_check = make_switch("Simulation")
-            self.auto_sim_check.setChecked(True)
-            self.auto_sim_check.toggled.connect(self.set_simulation)
             self.auto_moog_port = QtWidgets.QComboBox()
             self.auto_pol_port = QtWidgets.QComboBox()
             self.auto_refresh_btn = QtWidgets.QPushButton("Refresh ports")
@@ -1102,8 +982,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.auto_home_btn.clicked.connect(self.home_moog)
             self.auto_refresh_position_btn.clicked.connect(self.request_moog_status)
             self.auto_stop_btn.clicked.connect(self.stop_all)
-            auto_connection_layout.addWidget(self.auto_sim_check, 0, 0)
-            auto_connection_layout.addWidget(self.auto_refresh_btn, 0, 1)
+            auto_connection_layout.addWidget(self.auto_refresh_btn, 0, 0, 1, 2)
             auto_connection_layout.addWidget(QtWidgets.QLabel("Moog"), 1, 0)
             auto_connection_layout.addWidget(self.auto_moog_port, 1, 1)
             auto_connection_layout.addWidget(self.auto_moog_switch, 1, 2)
@@ -1286,13 +1165,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             connection_layout = QtWidgets.QGridLayout(connection_group)
             controls_layout.addWidget(connection_group)
 
-            self.sim_check = make_switch("Simulation")
-            self.sim_check.setChecked(True)
-            self.sim_check.toggled.connect(self.set_simulation)
             self.refresh_btn = QtWidgets.QPushButton("Refresh ports")
             self.refresh_btn.clicked.connect(self.refresh_ports)
-            connection_layout.addWidget(self.sim_check, 0, 0)
-            connection_layout.addWidget(self.refresh_btn, 0, 1)
+            connection_layout.addWidget(self.refresh_btn, 0, 0, 1, 2)
 
             self.moog_port = QtWidgets.QComboBox()
             self.pol_port = QtWidgets.QComboBox()
@@ -1510,10 +1385,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 f"last_wait={last_ms} ms, failures={failures}. "
                 f"Likely: {'; '.join(likely)}"
             )
-
-        def update_sim_camera_site(self):
-            if isinstance(self.camera, SimCameraController):
-                self.camera.set_site(self.latitude_input.value(), self.longitude_input.value())
 
         def fit_camera_preview(self):
             self.preview_fit = True
@@ -2133,11 +2004,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         )
                         capture_start = time.time()
                         with self.camera_lock:
-                            self.update_sim_camera_site()
-                            frame = np.asarray(
-                                self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg),
-                                dtype=np.uint16,
-                            )
+                            frame = np.asarray(self.camera.get_frame(), dtype=np.uint16)
                         uvmeastime = time.time() - capture_start
                         with self.motion_lock:
                             post_capture_status = self.moog.get_status()
@@ -2589,8 +2456,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         else:
                             metering_info = self.auto_exposure_metering_angles(
                                 angles,
-                                moog_status.pan_deg,
-                                moog_status.tilt_deg,
                                 target_median=config["target_median"],
                                 metric=config["auto_exposure_mode"],
                                 max_exposure_us=config["auto_exposure_max_us"],
@@ -2615,8 +2480,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         capture_exposure_us = float(self.camera.get_exposure())
                         self.camera.set_exposure(capture_exposure_us)
                         time.sleep(CAMERA_EXPOSURE_SETTLE_SEC)
-                        self.update_sim_camera_site()
-                        self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
+                        self.camera.get_frame()
 
                     pre_capture_dt = datetime.now().astimezone()
                     pre_capture_utc_dt = pre_capture_dt.astimezone(timezone.utc)
@@ -2636,8 +2500,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         polarizer_actual_angles.append(float(actual_angle))
                         time.sleep(POLARIZER_SETTLE_AFTER_IDLE_SEC)
                         with self.camera_lock:
-                            self.update_sim_camera_site()
-                            frame = self.camera.get_frame(moog_status.pan_deg, moog_status.tilt_deg)
+                            frame = self.camera.get_frame()
                         uv_frames.append(np.asarray(frame, dtype=np.uint16))
                     uvmeastime = time.time() - capture_start
                     with self.motion_lock:
@@ -3109,35 +2972,8 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             label.clear_frame()
                     self.log_msg(f"Updated acquisition 0 preview: {len(frames)} image(s)")
 
-        def set_simulation(self, checked):
-            for checkbox_name in ("sim_check", "auto_sim_check"):
-                checkbox = getattr(self, checkbox_name, None)
-                if checkbox is not None and checkbox.isChecked() != checked:
-                    checkbox.blockSignals(True)
-                    checkbox.setChecked(checked)
-                    checkbox.blockSignals(False)
-            self.simulation = checked
-            self.close_camera()
-            self.close_moog()
-            self.close_polarizer()
-            self.moog = SimMoogController() if checked else RealMoogController()
-            self.polarizer = SimPolarizerController() if checked else RealPolarizerController()
-            self.camera = SimCameraController() if checked else RealVmbCameraController()
-            if isinstance(self.camera, SimCameraController):
-                self.update_sim_camera_site()
-            self.current_status = self.moog.get_status()
-            if checked:
-                self.log_msg(
-                    "Simulation mode enabled: "
-                    "pan=0 points south, "
-                    f"sim pan mount offset={self.camera.pan_mount_offset_deg:+.2f} deg"
-                )
-            else:
-                self.log_msg("Hardware mode enabled")
-            self.apply_status()
-
         def refresh_ports(self):
-            ports = [DEFAULT_MOOG_PORT, DEFAULT_ZABER_PORT, "SIM"]
+            ports = [DEFAULT_MOOG_PORT, DEFAULT_ZABER_PORT]
             if serial is not None:
                 ports += [p.device for p in serial.tools.list_ports.comports()]
             ports = list(dict.fromkeys(ports))
@@ -3383,8 +3219,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def auto_exposure_metering_angles(
             self,
             angles,
-            pan_deg,
-            tilt_deg,
             target_median=AUTO_EXPOSURE_TARGET_MEDIAN,
             metric="median",
             max_exposure_us=None,
@@ -3396,18 +3230,22 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 metric = "median"
             exposure_limit = float(self.auto_exposure_max_us if max_exposure_us is None else max_exposure_us)
 
+            # Only meter at 0 deg and 90 deg regardless of the full acquisition angle list.
+            # This covers both polarization extremes while halving metering time vs. a 4-angle sweep.
+            metering_angles = [a for a in [0.0, 90.0] if any(abs(float(a) - float(r)) < 1.0 for r in angles)]
+            if not metering_angles:
+                metering_angles = [float(angles[0])]
+
             with self.camera_lock:
                 self.camera.set_exposure(AUTO_EXPOSURE_TEST_US)
                 time.sleep(CAMERA_EXPOSURE_SETTLE_SEC)
-                self.update_sim_camera_site()
-                self.camera.get_frame(pan_deg, tilt_deg)
+                self.camera.get_frame()
 
             stable_medians = []
             stable_maxima = []
             preview_frames = []
-            angle_values = [float(angle) for angle in angles]
             actual_angle_values = []
-            for angle in angle_values:
+            for angle in metering_angles:
                 with self.motion_lock:
                     actual_angle = self.polarizer.move_absolute(angle)
                 actual_angle_values.append(float(actual_angle))
@@ -3418,8 +3256,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 last_frame = None
                 for _ in range(AUTO_EXPOSURE_METERING_FRAMES):
                     with self.camera_lock:
-                        self.update_sim_camera_site()
-                        frame = self.camera.get_frame(pan_deg, tilt_deg)
+                        frame = self.camera.get_frame()
                     data = np.asarray(frame, dtype=np.uint16)
                     last_frame = data
                     angle_medians.append(float(np.median(data)))
@@ -3431,8 +3268,9 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
 
             medians_array = np.asarray(stable_medians, dtype=float)
             maxima_array = np.asarray(stable_maxima, dtype=float)
-            stable_median = float(np.mean(medians_array))
-            stable_max = float(np.mean(maxima_array))
+            # Use the maximum across metering angles to avoid under-exposing any polarization channel.
+            stable_median = float(np.max(medians_array))
+            stable_max = float(np.max(maxima_array))
 
             if stable_median >= saturation_limit:
                 new_exposure = AUTO_EXPOSURE_MIN_US
@@ -3464,11 +3302,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             with self.camera_lock:
                 self.camera.set_exposure(new_exposure)
                 time.sleep(CAMERA_EXPOSURE_SETTLE_SEC)
-                self.update_sim_camera_site()
-                self.camera.get_frame(pan_deg, tilt_deg)
+                self.camera.get_frame()
 
             message = (
-                f"Auto exposure metering angles={','.join(f'{angle:g}' for angle in angle_values)} deg, "
+                f"Auto exposure metering angles={','.join(f'{angle:g}' for angle in metering_angles)} deg "
+                f"(from configured {','.join(f'{angle:g}' for angle in angles)}), "
                 f"actual angles={','.join(f'{angle:.2f}' for angle in actual_angle_values)} deg, "
                 f"frames/angle={AUTO_EXPOSURE_METERING_FRAMES}, "
                 f"stable medians={medians_array.astype(int).tolist()}, "
@@ -3480,7 +3318,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "message": message,
                 "exposure_us": float(new_exposure),
                 "frames": preview_frames,
-                "angles": angle_values[:len(preview_frames)],
+                "angles": metering_angles[:len(preview_frames)],
                 "actual_angles": actual_angle_values[:len(preview_frames)],
                 "stable_medians": medians_array,
                 "stable_maxima": maxima_array,
@@ -3529,14 +3367,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_exposure = self.auto_exposure_check.isChecked()
             run_auto_exposure = auto_exposure and self.preview_frame_counter % PREVIEW_AUTO_EXPOSURE_INTERVAL == 0
             run_center_detection = self.preview_frame_counter % PREVIEW_CENTER_DETECT_INTERVAL == 0
-            pan_deg = self.current_status.pan_deg
-            tilt_deg = self.current_status.tilt_deg
             previous_center = self.last_center
 
             def task():
                 with self.camera_lock:
-                    self.update_sim_camera_site()
-                    frame = self.camera.get_frame(pan_deg, tilt_deg)
+                    frame = self.camera.get_frame()
                     exposure_info = None
                     if run_auto_exposure and not self.auto_job_running:
                         exposure_info = self.calculate_auto_exposure(frame)
@@ -3679,7 +3514,6 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
         def remote_status(self):
             status = self.current_status
             return {
-                "simulation": self.simulation,
                 "pan_deg": status.pan_deg,
                 "tilt_deg": status.tilt_deg,
                 "moog_connected": status.connected,
@@ -3747,8 +3581,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     initial_pan_deg = float(status.pan_deg)
                     initial_tilt_deg = float(status.tilt_deg)
                 with self.camera_lock:
-                    self.update_sim_camera_site()
-                    local_frame = self.camera.get_frame(initial_pan_deg, initial_tilt_deg)
+                    local_frame = self.camera.get_frame()
 
                 center, info = detect_sun_center(local_frame)
                 if center is None:
@@ -3774,8 +3607,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 sun_pan = azimuth_to_moog_pan(sun_azimuth)
                 pan_offset = quantize_pointing(sun_pan - centered_status.pan_deg)
                 with self.camera_lock:
-                    self.update_sim_camera_site()
-                    centered_frame = self.camera.get_frame(centered_status.pan_deg, centered_status.tilt_deg)
+                    centered_frame = self.camera.get_frame()
                 centered_center, _ = detect_sun_center(centered_frame)
                 self.result_queue.put(("frame", (centered_frame, centered_center, None), None))
                 return {
@@ -3823,7 +3655,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     meta = h5.create_group("Measurement_Metadata")
                     meta.attrs["Software Version"] = APP_VERSION
                     meta.attrs["Created Local Time"] = datetime.now().isoformat(timespec="seconds")
-                    meta.attrs["Mode"] = "Simulation" if self.simulation else "Hardware"
+                    meta.attrs["Mode"] = "Hardware"
                     meta.attrs["Purpose"] = "Manual pointing calibration"
                     meta.attrs["UV Image Width [px]"] = UV_IMAGE_WIDTH_PX
                     meta.attrs["UV Image Height [px]"] = UV_IMAGE_HEIGHT_PX
