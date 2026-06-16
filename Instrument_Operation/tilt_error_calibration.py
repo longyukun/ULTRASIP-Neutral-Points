@@ -81,12 +81,6 @@ DITHER_SETTLE_S  = 1.2   # settle time between dither steps (seconds)
 
 DEFAULT_DITHER_OFFSET_DEG = 1.0   # ±N° in both pan and tilt → 3×3 grid
 
-# Nominal pixel scale – used to predict where target should appear after dither.
-# Positive dpan  → target moves LEFT  (camera sees rightward scene motion)
-# Positive dtilt → target moves DOWN  (camera sees upward scene motion)
-# Signs can be wrong for a given instrument; they only affect search centering,
-# not the final fit, so an error of ±180° in sign just wastes a bit of margin.
-PX_PER_DEG = 1.0 / (7.20 / 3600.0)   # ≈ 500 px / degree
 
 
 # ── data structures ────────────────────────────────────────────────────────────
@@ -1028,15 +1022,11 @@ def main():
                 except Exception as exc:
                     self._sig_log.emit(f"Capture failed: {exc}"); continue
 
-                # Predict where target moved based on actual turntable displacement.
-                # pan right → scene moves left → cx decreases; tilt up → cy decreases.
-                dpan_actual_approx  = st.pan_deg  - pan_0
-                dtilt_actual_approx = st.tilt_deg - tilt_0
-                pred_cx = ref_cx - dpan_actual_approx  * PX_PER_DEG
-                pred_cy = ref_cy - dtilt_actual_approx * PX_PER_DEG
-
+                # Always search around the reference centroid with a window large
+                # enough to cover the full dither displacement in any direction.
+                # This avoids sign-convention errors in the prediction.
                 cx, cy, score = match_and_centroid(
-                    frame, self._template, pred_cx, pred_cy,
+                    frame, self._template, ref_cx, ref_cy,
                     margin=SEARCH_MARGIN_PX,
                 )
                 cur_cx, cur_cy = cx, cy
