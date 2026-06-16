@@ -75,9 +75,9 @@ from Measurement_QT_GUI import (
 APP_TITLE = "Tilt Error Calibration"
 APP_VER   = "2.1.0"
 
-SEARCH_MARGIN_PX = 99999  # effectively full-frame search
-MATCH_WARN_SCORE = 0.45  # NCC score below this → yellow warning
-DITHER_SETTLE_S  = 1.2   # settle time between dither steps (seconds)
+MATCH_WARN_SCORE  = 0.45           # NCC score below this → yellow warning
+DITHER_SETTLE_S   = 1.2            # settle time between dither steps (seconds)
+NOMINAL_PX_PER_DEG = 3600.0 / 7.20  # ≈ 500 px/° — used only for yellow preview marker
 
 DEFAULT_DITHER_OFFSET_DEG = 1.0   # ±N° in both pan and tilt → 3×3 grid
 
@@ -387,6 +387,8 @@ def main():
             self._target_cy:  Optional[float]      = None
             self._match_cx:   Optional[float]      = None   # latest matched centroid
             self._match_cy:   Optional[float]      = None
+            self._pred_cx:    Optional[float]      = None   # theoretical centroid (yellow)
+            self._pred_cy:    Optional[float]      = None
             # template bounding box in full-image coords (x0,y0,x1,y1)
             self._tmpl_rect:  Optional[Tuple[int,int,int,int]] = None
             self._live_preview = False   # True while move/settle preview thread runs
@@ -730,6 +732,16 @@ def main():
                     cy = self._target_cy / stride
                     painter.drawLine(int(cx - 12), int(cy), int(cx + 12), int(cy))
                     painter.drawLine(int(cx), int(cy - 12), int(cx), int(cy + 12))
+                # yellow crosshair: theoretical (predicted) centroid
+                if self._pred_cx is not None:
+                    pen = QtGui.QPen(QtGui.QColor(255, 220, 0))
+                    pen.setWidth(2)
+                    painter.setPen(pen)
+                    px_ = self._pred_cx / stride
+                    py_ = self._pred_cy / stride
+                    painter.drawLine(int(px_ - 18), int(py_), int(px_ + 18), int(py_))
+                    painter.drawLine(int(px_), int(py_ - 18), int(px_), int(py_ + 18))
+                    painter.drawEllipse(int(px_ - 6), int(py_ - 6), 12, 12)
                 # red crosshair: latest matched centroid
                 if self._match_cx is not None:
                     pen = QtGui.QPen(QtGui.QColor(255, 60, 60))
@@ -797,6 +809,8 @@ def main():
             self._tmpl_rect = None
             self._match_cx  = None
             self._match_cy  = None
+            self._pred_cx   = None
+            self._pred_cy   = None
             # Allow skipping before a target is chosen
             self._skip_btn.setEnabled(True)
             self._accept_btn.setEnabled(False)
@@ -900,23 +914,28 @@ def main():
                     self._pan_points.append(skipped_pt)
                     continue
 
+                # Read actual pan after any jog adjustments made during click-wait.
+                actual_st = self.moog.get_status()
+                pan_0_actual  = actual_st.pan_deg
+                tilt_0_actual = actual_st.tilt_deg
+
                 pan_point = PanPoint(
                     pan_index=idx,
                     pan_cmd_deg=pan_c,
-                    pan_actual_deg=self.moog.get_status().pan_deg,
-                    tilt_0_deg=tilt_c,
+                    pan_actual_deg=pan_0_actual,
+                    tilt_0_deg=tilt_0_actual,
                     timestamp=datetime.now(timezone.utc).isoformat(),
                 )
 
                 # -- dither loop (with retry support) -------------------------
                 while self._running:
-                    success = self._do_dither(pan_point, pan_c, tilt_c, grid)
+                    success = self._do_dither(pan_point, pan_0_actual, tilt_0_actual, grid)
                     if not success:
                         break
 
-                    # return to nominal tilt before showing result
+                    # return to the (possibly jogged) nominal position
                     try:
-                        self.moog.move_absolute(pan_c, tilt_c)
+                        self.moog.move_absolute(pan_0_actual, tilt_0_actual)
                     except Exception:
                         pass
 
@@ -1004,11 +1023,16 @@ def main():
                 cx, cy, score = match_and_centroid(frame, self._template)
                 cur_cx, cur_cy = cx, cy
                 self._match_cx, self._match_cy = cx, cy
-                self._sig_frame.emit(frame)   # emit after match so overlay includes red dot
                 min_score = min(min_score, score)
 
                 dpan_actual  = st.pan_deg  - pan_0
                 dtilt_actual = st.tilt_deg - tilt_0
+
+                # Theoretical centroid: where target should be if tilt error = 0.
+                # pan right → scene moves left (cx↓); tilt up → scene moves down (cy↓).
+                self._pred_cx = ref_cx - dpan_actual  * NOMINAL_PX_PER_DEG
+                self._pred_cy = ref_cy - dtilt_actual * NOMINAL_PX_PER_DEG
+                self._sig_frame.emit(frame)   # emit after all markers are set
                 dcx = cx - ref_cx
                 dcy = cy - ref_cy
 
