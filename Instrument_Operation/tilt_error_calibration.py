@@ -691,6 +691,10 @@ def main():
             self._target_cx = None
             self._target_cy = None
             self._template  = None
+            # Allow skipping before a target is chosen
+            self._skip_btn.setEnabled(True)
+            self._accept_btn.setEnabled(False)
+            self._retry_btn.setEnabled(False)
 
         # ── calibration start ──────────────────────────────────────────────────
         def _dither_grid(self) -> List[Tuple[float, float]]:
@@ -769,12 +773,25 @@ def main():
                 self._sig_status_update(f"Pan {idx+1}/{n_steps}  ← Click target in image")
 
                 self._start_live_preview()
-                self._click_event.wait()        # blocks until _on_image_click fires
+                self._click_event.wait()        # blocks until _on_image_click fires or Skip
                 self._stop_live_preview()
+                self._step_event.clear()        # reset so dither's own wait works correctly
 
                 if not self._running:
                     break
-                if self._template is None:
+                # Skip pressed before target was clicked
+                if self._template is None or self._step_action == "skip":
+                    self._step_action = ""
+                    self._sig_log.emit(f"Pan position {idx+1} skipped.")
+                    skipped_pt = PanPoint(
+                        pan_index=idx,
+                        pan_cmd_deg=pan_c,
+                        pan_actual_deg=pan_c,
+                        tilt_0_deg=tilt_c,
+                        skipped=True,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                    )
+                    self._pan_points.append(skipped_pt)
                     continue
 
                 pan_point = PanPoint(
@@ -819,6 +836,7 @@ def main():
                         self._start_live_preview()
                         self._click_event.wait()
                         self._stop_live_preview()
+                        self._step_event.clear()
 
             self._sig_log.emit("All pan positions complete.")
             self._update_sinusoid_fit()
@@ -960,7 +978,11 @@ def main():
         def _user_action(self, action: str):
             for b in (self._accept_btn, self._retry_btn, self._skip_btn):
                 b.setEnabled(False)
+            self._click_banner.setVisible(False)
             self._step_action = action
+            # If skip is pressed while still waiting for a target click,
+            # release the click event so the worker unblocks.
+            self._click_event.set()
             self._step_event.set()
 
         def _abort(self):
