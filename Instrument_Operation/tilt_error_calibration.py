@@ -75,7 +75,7 @@ from Measurement_QT_GUI import (
 APP_TITLE = "Tilt Error Calibration"
 APP_VER   = "2.1.0"
 
-SEARCH_MARGIN_PX = 720   # extra pixels around predicted position for search window
+SEARCH_MARGIN_PX = 99999  # effectively full-frame search
 MATCH_WARN_SCORE = 0.45  # NCC score below this → yellow warning
 DITHER_SETTLE_S  = 1.2   # settle time between dither steps (seconds)
 
@@ -131,44 +131,25 @@ def weighted_centroid(patch: np.ndarray) -> Tuple[float, float]:
 def match_and_centroid(
     frame: np.ndarray,
     template: np.ndarray,
-    pred_cx: float,
-    pred_cy: float,
-    margin: int = SEARCH_MARGIN_PX,
 ) -> Tuple[float, float, float]:
     """
-    Search for `template` inside a window of half-size `margin` centred on
-    (pred_cx, pred_cy) – the *predicted* position of the target.
-
+    Full-frame NCC template match followed by centroid refinement.
     Returns (cx, cy, ncc_score) in full-frame pixels.
     """
-    h, w = frame.shape[:2]
+    h, w   = frame.shape[:2]
     th, tw = template.shape[:2]
-    half_h = max(margin, th // 2 + 4)
-    half_w = max(margin, tw // 2 + 4)
-    sr0 = max(0, int(pred_cy) - half_h)
-    sr1 = min(h, int(pred_cy) + half_h)
-    sc0 = max(0, int(pred_cx) - half_w)
-    sc1 = min(w, int(pred_cx) + half_w)
 
-    if cv2 is None:
-        patch = frame[sr0:sr1, sc0:sc1]
-        lcx, lcy = weighted_centroid(patch)
-        return sc0 + lcx, sr0 + lcy, 0.0
+    if cv2 is None or h <= th or w <= tw:
+        lcx, lcy = weighted_centroid(frame)
+        return lcx, lcy, 0.0
 
-    search = frame[sr0:sr1, sc0:sc1].astype(np.float32)
-    tmpl   = template.astype(np.float32)
-    if search.shape[0] <= tmpl.shape[0] or search.shape[1] <= tmpl.shape[1]:
-        # search window not large enough – fall back to centroid
-        patch = frame[sr0:sr1, sc0:sc1]
-        lcx, lcy = weighted_centroid(patch)
-        return sc0 + lcx, sr0 + lcy, 0.0
-
-    res = cv2.matchTemplate(search, tmpl, cv2.TM_CCOEFF_NORMED)
+    res = cv2.matchTemplate(
+        frame.astype(np.float32), template.astype(np.float32), cv2.TM_CCOEFF_NORMED
+    )
     _, score, _, (mx, my) = cv2.minMaxLoc(res)
-    pr0 = sr0 + my;  pr1 = min(h, pr0 + th)
-    pc0 = sc0 + mx;  pc1 = min(w, pc0 + tw)
-    patch = frame[pr0:pr1, pc0:pc1]
-    lcx, lcy = weighted_centroid(patch)
+    pr0 = my;              pr1 = min(h, pr0 + th)
+    pc0 = mx;              pc1 = min(w, pc0 + tw)
+    lcx, lcy = weighted_centroid(frame[pr0:pr1, pc0:pc1])
     return pc0 + lcx, pr0 + lcy, float(score)
 
 
@@ -991,10 +972,7 @@ def main():
 
             # Re-match the reference frame to get a sub-pixel centroid at (0,0).
             # Use a small search window here since we're at the lock position.
-            rx, ry, _ = match_and_centroid(
-                ref_frame, self._template, self._target_cx, self._target_cy,
-                margin=SEARCH_MARGIN_PX,
-            )
+            rx, ry, _ = match_and_centroid(ref_frame, self._template)
             ref_cx, ref_cy = rx, ry
             pan_point.dither_steps.clear()
             min_score = 1.0
@@ -1022,13 +1000,8 @@ def main():
                 except Exception as exc:
                     self._sig_log.emit(f"Capture failed: {exc}"); continue
 
-                # Always search around the reference centroid with a window large
-                # enough to cover the full dither displacement in any direction.
-                # This avoids sign-convention errors in the prediction.
-                cx, cy, score = match_and_centroid(
-                    frame, self._template, ref_cx, ref_cy,
-                    margin=SEARCH_MARGIN_PX,
-                )
+                # Full-frame search: no dependency on position prediction or margins.
+                cx, cy, score = match_and_centroid(frame, self._template)
                 cur_cx, cur_cy = cx, cy
                 self._match_cx, self._match_cy = cx, cy
                 self._sig_frame.emit(frame)   # emit after match so overlay includes red dot
