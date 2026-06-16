@@ -338,6 +338,8 @@ def main():
             self._template:   Optional[np.ndarray] = None
             self._target_cx:  Optional[float]      = None
             self._target_cy:  Optional[float]      = None
+            self._match_cx:   Optional[float]      = None   # latest matched centroid
+            self._match_cy:   Optional[float]      = None
             self._live_preview = False   # True while move/settle preview thread runs
 
             self._pan_points: List[PanPoint] = []
@@ -461,6 +463,27 @@ def main():
             )
             self._click_banner.setVisible(False)
             rl.addWidget(self._click_banner)
+
+            # pan jog row
+            jog_grp = QtWidgets.QGroupBox("Pan Jog")
+            jog_lay = QtWidgets.QHBoxLayout(jog_grp)
+            jog_lay.setContentsMargins(4, 4, 4, 4)
+            self._jog_left_btn  = QtWidgets.QPushButton("◀◀")
+            self._jog_left_btn.setToolTip("Pan left (hold to repeat)")
+            self._jog_right_btn = QtWidgets.QPushButton("▶▶")
+            self._jog_right_btn.setToolTip("Pan right (hold to repeat)")
+            self._jog_step_spin = QtWidgets.QDoubleSpinBox()
+            self._jog_step_spin.setRange(0.01, 10.0)
+            self._jog_step_spin.setDecimals(2)
+            self._jog_step_spin.setValue(0.5)
+            self._jog_step_spin.setSuffix(" °")
+            self._jog_step_spin.setFixedWidth(72)
+            jog_lay.addWidget(self._jog_left_btn)
+            jog_lay.addWidget(self._jog_step_spin)
+            jog_lay.addWidget(self._jog_right_btn)
+            self._jog_left_btn.clicked.connect(lambda: self._jog_pan(-self._jog_step_spin.value()))
+            self._jog_right_btn.clicked.connect(lambda: self._jog_pan(+self._jog_step_spin.value()))
+            rl.addWidget(jog_grp)
 
             self._score_lbl = QtWidgets.QLabel("Match score: —")
             rl.addWidget(self._score_lbl)
@@ -642,18 +665,28 @@ def main():
             self._last_frame = frame
 
             def overlay(pix, stride):
-                if self._target_cx is None:
-                    return
                 painter = QtGui.QPainter(pix)
-                pen = QtGui.QPen(QtGui.QColor(0, 255, 0))
-                pen.setWidth(2)
-                painter.setPen(pen)
-                cx = self._target_cx / stride
-                cy = self._target_cy / stride
-                r  = TEMPLATE_HALF / stride
-                painter.drawRect(int(cx - r), int(cy - r), int(2 * r), int(2 * r))
-                painter.drawLine(int(cx - 15), int(cy), int(cx + 15), int(cy))
-                painter.drawLine(int(cx), int(cy - 15), int(cx), int(cy + 15))
+                # green box + crosshair: template lock position
+                if self._target_cx is not None:
+                    pen = QtGui.QPen(QtGui.QColor(0, 255, 0))
+                    pen.setWidth(2)
+                    painter.setPen(pen)
+                    cx = self._target_cx / stride
+                    cy = self._target_cy / stride
+                    r  = TEMPLATE_HALF / stride
+                    painter.drawRect(int(cx - r), int(cy - r), int(2 * r), int(2 * r))
+                    painter.drawLine(int(cx - 15), int(cy), int(cx + 15), int(cy))
+                    painter.drawLine(int(cx), int(cy - 15), int(cx), int(cy + 15))
+                # red crosshair: latest matched centroid
+                if self._match_cx is not None:
+                    pen = QtGui.QPen(QtGui.QColor(255, 60, 60))
+                    pen.setWidth(2)
+                    painter.setPen(pen)
+                    mx = self._match_cx / stride
+                    my = self._match_cy / stride
+                    painter.drawLine(int(mx - 18), int(my), int(mx + 18), int(my))
+                    painter.drawLine(int(mx), int(my - 18), int(mx), int(my + 18))
+                    painter.drawEllipse(int(mx - 6), int(my - 6), 12, 12)
                 painter.end()
 
             self._cam.set_frame(frame, overlay_fn=overlay)
@@ -661,6 +694,18 @@ def main():
         def _on_status(self, st: PointingStatus):
             self._pan_lbl.setText(f"Pan: {st.pan_deg:+.2f}°")
             self._tilt_lbl.setText(f"Tilt: {st.tilt_deg:+.2f}°")
+
+        def _jog_pan(self, delta_deg: float):
+            if not self.moog.status.connected:
+                return
+            threading.Thread(target=self._jog_worker, args=(delta_deg,), daemon=True).start()
+
+        def _jog_worker(self, delta_deg: float):
+            try:
+                st = self.moog.move_relative(delta_deg, 0.0)
+                self._sig_status.emit(st)
+            except Exception as exc:
+                self._sig_log.emit(f"Pan jog failed: {exc}")
 
         def _on_log(self, msg: str):
             self._log.appendPlainText(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -691,6 +736,8 @@ def main():
             self._target_cx = None
             self._target_cy = None
             self._template  = None
+            self._match_cx  = None
+            self._match_cy  = None
             # Allow skipping before a target is chosen
             self._skip_btn.setEnabled(True)
             self._accept_btn.setEnabled(False)
@@ -892,12 +939,13 @@ def main():
 
                 try:
                     frame = self._grab_frame()
-                    self._sig_frame.emit(frame)
                 except Exception as exc:
                     self._sig_log.emit(f"Capture failed: {exc}"); continue
 
                 cx, cy, score = match_and_centroid(frame, self._template, cur_cx, cur_cy)
                 cur_cx, cur_cy = cx, cy
+                self._match_cx, self._match_cy = cx, cy
+                self._sig_frame.emit(frame)   # emit after match so overlay includes red dot
                 min_score = min(min_score, score)
 
                 dpan_actual  = st.pan_deg  - pan_0
