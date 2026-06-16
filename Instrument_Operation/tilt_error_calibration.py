@@ -253,9 +253,14 @@ def main():
         def wheelEvent(self, event):
             event.ignore()
 
-    # ── clickable camera preview ───────────────────────────────────────────────
+    # ── drag-to-select camera preview ─────────────────────────────────────────
     class CameraView(QtWidgets.QLabel):
-        clicked = QtCore.Signal(float, float)
+        """
+        Displays camera frames.  The user drags a rubber-band rectangle to
+        define the template region; on mouse release the signal `roi_selected`
+        fires with (x0, y0, x1, y1) in full-image pixel coordinates.
+        """
+        roi_selected = QtCore.Signal(float, float, float, float)
 
         def __init__(self):
             super().__init__()
@@ -267,6 +272,8 @@ def main():
             self._frame_shape = (UV_IMAGE_HEIGHT_PX, UV_IMAGE_WIDTH_PX)
             cursor = getattr(getattr(QtCore.Qt, "CursorShape", QtCore.Qt), "CrossCursor")
             self.setCursor(QtGui.QCursor(cursor))
+            self._drag_start: Optional[QtCore.QPoint] = None
+            self._drag_rect:  Optional[QtCore.QRect]  = None   # in widget coords
 
         def set_frame(self, frame: np.ndarray, overlay_fn=None):
             self._frame_shape = frame.shape[:2]
@@ -288,23 +295,64 @@ def main():
             self._pixmap = pix
             self._rescale()
 
-        def mousePressEvent(self, event):
+        # ── coordinate helpers ─────────────────────────────────────────────────
+        def _widget_to_image(self, wx: float, wy: float) -> Tuple[float, float]:
+            """Convert widget pixel → full-image pixel (clamped)."""
             if self._pixmap is None:
-                return
-            left = getattr(getattr(QtCore.Qt, "MouseButton", QtCore.Qt), "LeftButton")
-            if event.button() != left:
-                return
-            side   = min(self.width(), self.height())
-            ox     = (self.width()  - side) / 2
-            oy     = (self.height() - side) / 2
-            scale  = self._pixmap.width() / side
-            px     = (event.x() - ox) * scale
-            py     = (event.y() - oy) * scale
+                return 0.0, 0.0
+            side  = min(self.width(), self.height())
+            ox    = (self.width()  - side) / 2
+            oy    = (self.height() - side) / 2
+            scale = self._pixmap.width() / side       # pixmap px per widget px
+            px    = (wx - ox) * scale
+            py    = (wy - oy) * scale
             ih, iw = self._frame_shape
-            self.clicked.emit(
-                px / self._pixmap.width()  * iw,
-                py / self._pixmap.height() * ih,
-            )
+            img_x = px / self._pixmap.width()  * iw
+            img_y = py / self._pixmap.height() * ih
+            return float(np.clip(img_x, 0, iw - 1)), float(np.clip(img_y, 0, ih - 1))
+
+        # ── mouse events ───────────────────────────────────────────────────────
+        def mousePressEvent(self, event):
+            left = getattr(getattr(QtCore.Qt, "MouseButton", QtCore.Qt), "LeftButton")
+            if event.button() != left or self._pixmap is None:
+                return
+            self._drag_start = event.pos()
+            self._drag_rect  = None
+
+        def mouseMoveEvent(self, event):
+            if self._drag_start is None:
+                return
+            self._drag_rect = QtCore.QRect(self._drag_start, event.pos()).normalized()
+            self.update()   # trigger paintEvent for rubber-band
+
+        def mouseReleaseEvent(self, event):
+            left = getattr(getattr(QtCore.Qt, "MouseButton", QtCore.Qt), "LeftButton")
+            if event.button() != left or self._drag_start is None:
+                return
+            end = event.pos()
+            rect = QtCore.QRect(self._drag_start, end).normalized()
+            self._drag_start = None
+            self._drag_rect  = None
+            self.update()
+            # ignore tiny accidental clicks (< 10 px in either dimension)
+            if rect.width() < 10 or rect.height() < 10:
+                return
+            x0, y0 = self._widget_to_image(rect.left(),  rect.top())
+            x1, y1 = self._widget_to_image(rect.right(), rect.bottom())
+            self.roi_selected.emit(x0, y0, x1, y1)
+
+        def paintEvent(self, event):
+            super().paintEvent(event)
+            if self._drag_rect is not None:
+                painter = QtGui.QPainter(self)
+                pen = QtGui.QPen(QtGui.QColor(255, 220, 0))
+                pen.setWidth(2)
+                pen.setStyle(
+                    getattr(getattr(QtCore.Qt, "PenStyle", QtCore.Qt), "DashLine")
+                )
+                painter.setPen(pen)
+                painter.drawRect(self._drag_rect)
+                painter.end()
 
         def _rescale(self):
             if not self._pixmap:
@@ -349,6 +397,8 @@ def main():
             self._target_cy:  Optional[float]      = None
             self._match_cx:   Optional[float]      = None   # latest matched centroid
             self._match_cy:   Optional[float]      = None
+            # template bounding box in full-image coords (x0,y0,x1,y1)
+            self._tmpl_rect:  Optional[Tuple[int,int,int,int]] = None
             self._live_preview = False   # True while move/settle preview thread runs
 
             self._pan_points: List[PanPoint] = []
@@ -464,7 +514,7 @@ def main():
             rl.addWidget(self._status_lbl)
 
             # click instruction banner
-            self._click_banner = QtWidgets.QLabel("👆  Click the image to lock a target")
+            self._click_banner = QtWidgets.QLabel("✏  Drag to draw a template rectangle")
             self._click_banner.setAlignment(align_center)
             self._click_banner.setStyleSheet(
                 "background:#fff3cd;color:#856404;border:1px solid #ffc107;"
@@ -539,10 +589,10 @@ def main():
             right.setSpacing(6)
             root.addLayout(right, stretch=1)
 
-            cam_grp = QtWidgets.QGroupBox("Camera  (click image to lock target at each pan position)")
+            cam_grp = QtWidgets.QGroupBox("Camera  (drag to draw template rectangle at each pan position)")
             cl = QtWidgets.QVBoxLayout(cam_grp)
             self._cam = CameraView()
-            self._cam.clicked.connect(self._on_image_click)
+            self._cam.roi_selected.connect(self._on_roi_selected)
             cl.addWidget(self._cam, alignment=align_center)
 
             pt_row = QtWidgets.QHBoxLayout()
@@ -675,17 +725,21 @@ def main():
 
             def overlay(pix, stride):
                 painter = QtGui.QPainter(pix)
-                # green box + crosshair: template lock position
-                if self._target_cx is not None:
+                # green box: user-drawn template rectangle
+                if self._tmpl_rect is not None:
                     pen = QtGui.QPen(QtGui.QColor(0, 255, 0))
                     pen.setWidth(2)
                     painter.setPen(pen)
+                    c0, r0, c1, r1 = self._tmpl_rect
+                    painter.drawRect(
+                        int(c0 / stride), int(r0 / stride),
+                        int((c1 - c0) / stride), int((r1 - r0) / stride),
+                    )
+                    # centre crosshair
                     cx = self._target_cx / stride
                     cy = self._target_cy / stride
-                    r  = TEMPLATE_HALF / stride
-                    painter.drawRect(int(cx - r), int(cy - r), int(2 * r), int(2 * r))
-                    painter.drawLine(int(cx - 15), int(cy), int(cx + 15), int(cy))
-                    painter.drawLine(int(cx), int(cy - 15), int(cx), int(cy + 15))
+                    painter.drawLine(int(cx - 12), int(cy), int(cx + 12), int(cy))
+                    painter.drawLine(int(cx), int(cy - 12), int(cx), int(cy + 12))
                 # red crosshair: latest matched centroid
                 if self._match_cx is not None:
                     pen = QtGui.QPen(QtGui.QColor(255, 60, 60))
@@ -723,18 +777,23 @@ def main():
             self._sig_log.emit(msg)
 
         # ── image click → lock target ──────────────────────────────────────────
-        def _on_image_click(self, img_x: float, img_y: float):
+        def _on_roi_selected(self, x0: float, y0: float, x1: float, y1: float):
             if self._last_frame is None:
                 return
-            frame  = self._last_frame
-            h, w   = frame.shape[:2]
-            cx, cy = float(img_x), float(img_y)
-            r0 = max(0, int(cy) - TEMPLATE_HALF);  r1 = min(h, int(cy) + TEMPLATE_HALF)
-            c0 = max(0, int(cx) - TEMPLATE_HALF);  c1 = min(w, int(cx) + TEMPLATE_HALF)
+            frame = self._last_frame
+            h, w  = frame.shape[:2]
+            c0, r0 = int(np.clip(x0, 0, w - 1)), int(np.clip(y0, 0, h - 1))
+            c1, r1 = int(np.clip(x1, 1, w)),     int(np.clip(y1, 1, h))
+            if c1 <= c0 or r1 <= r0:
+                return
             self._template  = frame[r0:r1, c0:c1].copy()
-            self._target_cx = cx
-            self._target_cy = cy
-            self._log_msg(f"Target locked at ({cx:.0f}, {cy:.0f}) px — template {c1-c0}×{r1-r0}")
+            self._tmpl_rect = (c0, r0, c1, r1)
+            self._target_cx = (c0 + c1) / 2.0
+            self._target_cy = (r0 + r1) / 2.0
+            self._log_msg(
+                f"Template selected: ({c0},{r0})→({c1},{r1})  size {c1-c0}×{r1-r0} px  "
+                f"centre ({self._target_cx:.0f}, {self._target_cy:.0f})"
+            )
             self._click_banner.setVisible(False)
             self._on_frame(frame)
             self._click_event.set()   # release worker if waiting
@@ -745,6 +804,7 @@ def main():
             self._target_cx = None
             self._target_cy = None
             self._template  = None
+            self._tmpl_rect = None
             self._match_cx  = None
             self._match_cy  = None
             # Allow skipping before a target is chosen
