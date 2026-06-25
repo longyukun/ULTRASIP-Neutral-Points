@@ -37,36 +37,20 @@ py pro3600_serial_windows.py --port COM3
 
 Replace `COM3` with the actual PRO3600 serial port.
 
-## 3. Run with Moog Python control
+## 3. Run with Moog control
 
-Run from the same folder as `moog_functions.py` so Python can import it:
+Run from the same folder as `moog_functions.py` so Python can import it.  The
+script uses the same Moog path as `Measurement_QT_GUI.py`: it opens the Moog
+serial port, calls `moog_functions.init_autobaud()`, then moves with
+`moog_functions.move_to_coord_and_wait(serial_port, int(pan*10), int(tilt*10))`.
 
 ```bat
 cd Instrument_Operation
-py pro3600_moog_pitch_roll_calibration.py --port COM3 --output-dir calibration_outputs
+py pro3600_moog_pitch_roll_calibration.py --level-port COM3 --moog-port COM7 --output-dir calibration_outputs
 ```
 
-If automatic Moog function detection does not find the right move function,
-pass the exact function names:
-
-```bat
-py pro3600_moog_pitch_roll_calibration.py --port COM3 --moog-function move_moog --output-dir calibration_outputs
-```
-
-If `moog_functions.py` needs explicit open/close calls:
-
-```bat
-py pro3600_moog_pitch_roll_calibration.py --port COM3 --moog-init connect_moog --moog-function move_moog --moog-close close_moog --output-dir calibration_outputs
-```
-
-The move function can accept any of these common forms:
-
-```python
-move(pan)
-move(pan, tilt)
-move(pan=pan, tilt=tilt)
-move(azimuth=pan, elevation=tilt)
-```
+`COM3` is the PRO3600 level port.  `COM7` is the Moog port used by the GUI
+defaults; change both to match Windows Device Manager.
 
 ## 4. Run through a command adapter
 

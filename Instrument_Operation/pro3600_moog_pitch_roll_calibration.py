@@ -16,8 +16,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
-import inspect
 import json
 import math
 import os
@@ -28,7 +26,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Iterable
 
 try:
     import serial
@@ -40,6 +38,7 @@ except ImportError:
 
 
 DEFAULT_BAUD = 9600
+DEFAULT_MOOG_PORT = "COM7"
 DEFAULT_TRIGGER = "tx-break-pulse"
 DEFAULT_REPEAT_TRIGGER = 1.0
 DEFAULT_PULSE_WIDTH = 0.2
@@ -132,7 +131,7 @@ class PRO3600Reader:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.ser = serial.Serial(
-            port=args.port,
+            port=args.level_port,
             baudrate=args.baud,
             bytesize=args.bytesize,
             parity=PARITY_CHOICES[args.parity],
@@ -224,100 +223,41 @@ class CommandMoog(MoogBackend):
         subprocess.run(command, shell=True, check=True)
 
 
-class PythonMoog(MoogBackend):
-    """Best-effort adapter for local moog_functions.py style modules.
+class MoogFunctionsMoog(MoogBackend):
+    """Moog backend using Instrument_Operation/moog_functions.py directly."""
 
-    Prefer passing --moog-function if you know the exact function.  The target
-    function should accept one of these forms:
-        fn(pan)
-        fn(pan, tilt)
-        fn(azimuth=pan, elevation=tilt)
-        fn(pan=pan, tilt=tilt)
-    """
+    def __init__(self, port: str, tilt_deg: float, move_timeout: float) -> None:
+        import moog_functions as mf
 
-    def __init__(
-        self,
-        module_name: str,
-        function_name: str | None,
-        init_name: str | None,
-        close_name: str | None,
-        tilt_deg: float,
-    ) -> None:
-        self.module = importlib.import_module(module_name)
+        self.mf = mf
+        self.port = port
         self.tilt_deg = tilt_deg
-        self.controller: Any | None = None
-        if init_name:
-            self.controller = getattr(self.module, init_name)()
-        self.move_func = self._resolve_callable(function_name)
-        self.close_func = getattr(self.module, close_name) if close_name else None
-
-    def _resolve_callable(self, function_name: str | None) -> Callable[..., Any]:
-        if function_name:
-            target = getattr(self.module, function_name)
-            if self.controller is not None and not inspect.ismethod(target):
-                return lambda *args, **kwargs: target(self.controller, *args, **kwargs)
-            return target
-
-        candidates = (
-            "move_pan",
-            "move_to_pan",
-            "move_moog_pan",
-            "set_pan",
-            "set_moog_pan",
-            "move_to",
-            "move_moog",
-            "point_moog",
-            "go_to",
-            "goto",
-        )
-        for name in candidates:
-            target = getattr(self.module, name, None)
-            if callable(target):
-                if self.controller is not None and not inspect.ismethod(target):
-                    return lambda *args, _target=target, **kwargs: _target(self.controller, *args, **kwargs)
-                return target
-        raise AttributeError(
-            f"No Moog move function found in {self.module.__name__}. "
-            "Pass --moog-function with the exact function name."
-        )
+        self.move_timeout = move_timeout
+        self.serial_port = serial.Serial()
+        self.serial_port.baudrate = 9600
+        self.serial_port.port = port
+        self.serial_port.timeout = 1.0
+        self.serial_port.write_timeout = 1.0
+        self.serial_port.open()
+        self.mf.init_autobaud(self.serial_port)
+        status = self.mf.get_status_jog(self.serial_port, verbose=False)
+        print(f"Moog opened on {port}: pan={status.pan_coord:.2f}, tilt={status.tilt_coord:.2f}")
 
     def move_pan(self, pan_deg: float) -> None:
-        call_with_pan_tilt(self.move_func, pan_deg, self.tilt_deg)
+        target_pan = int(round(pan_deg * 10.0))
+        target_tilt = int(round(self.tilt_deg * 10.0))
+        status = self.mf.move_to_coord_and_wait(
+            self.serial_port,
+            target_pan,
+            target_tilt,
+            timeout=self.move_timeout,
+            verbose=False,
+        )
+        print(f"    Moog actual pan={status.pan_coord:.2f}, tilt={status.tilt_coord:.2f}")
 
     def close(self) -> None:
-        if self.close_func is not None:
-            if self.controller is not None:
-                self.close_func(self.controller)
-            else:
-                self.close_func()
-
-
-def call_with_pan_tilt(func: Callable[..., Any], pan_deg: float, tilt_deg: float) -> Any:
-    sig = inspect.signature(func)
-    names = list(sig.parameters)
-    lower_names = {name.lower(): name for name in names}
-
-    kwargs: dict[str, float] = {}
-    for aliases, value in (
-        (("pan", "azimuth", "az", "theta"), pan_deg),
-        (("tilt", "elevation", "el", "pitch"), tilt_deg),
-    ):
-        for alias in aliases:
-            if alias in lower_names:
-                kwargs[lower_names[alias]] = value
-                break
-    if kwargs:
-        return func(**kwargs)
-
-    required = [
-        p
-        for p in sig.parameters.values()
-        if p.default is inspect._empty
-        and p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    if len(required) <= 1:
-        return func(pan_deg)
-    return func(pan_deg, tilt_deg)
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
 
 
 def build_moog_backend(args: argparse.Namespace) -> MoogBackend:
@@ -327,12 +267,10 @@ def build_moog_backend(args: argparse.Namespace) -> MoogBackend:
         if not args.moog_command:
             raise ValueError("--moog-command is required when --moog-mode command")
         return CommandMoog(args.moog_command)
-    return PythonMoog(
-        module_name=args.moog_module,
-        function_name=args.moog_function,
-        init_name=args.moog_init,
-        close_name=args.moog_close,
+    return MoogFunctionsMoog(
+        port=args.moog_port,
         tilt_deg=args.tilt,
+        move_timeout=args.moog_move_timeout,
     )
 
 
@@ -468,7 +406,14 @@ def parse_args() -> argparse.Namespace:
         description="Sweep Moog pan and fit pitch/roll from PRO3600 level readings."
     )
     parser.add_argument("--list-ports", action="store_true", help="List serial ports and exit.")
-    parser.add_argument("-p", "--port", default="COM3", help="PRO3600 Windows COM port. Default: COM3.")
+    parser.add_argument(
+        "-p",
+        "--port",
+        "--level-port",
+        dest="level_port",
+        default="COM3",
+        help="PRO3600 Windows COM port. Default: COM3.",
+    )
     parser.add_argument("-b", "--baud", type=int, default=DEFAULT_BAUD, help="Baud rate. Default: 9600.")
     parser.add_argument("--bytesize", type=int, choices=(5, 6, 7, 8), default=8)
     parser.add_argument("--parity", choices=tuple(PARITY_CHOICES), default="none")
@@ -488,14 +433,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tilt", type=float, default=0.0, help="Moog tilt/elevation held during pan sweep.")
     parser.add_argument(
         "--moog-mode",
-        choices=("python", "command", "dry-run"),
-        default="python",
-        help="Moog control backend. Default: python.",
+        choices=("moog-functions", "command", "dry-run"),
+        default="moog-functions",
+        help="Moog control backend. Default: moog-functions.",
     )
-    parser.add_argument("--moog-module", default="moog_functions", help="Python Moog module. Default: moog_functions.")
-    parser.add_argument("--moog-function", help="Exact Python function for moving pan.")
-    parser.add_argument("--moog-init", help="Optional Python function to initialize Moog connection.")
-    parser.add_argument("--moog-close", help="Optional Python function to close Moog connection.")
+    parser.add_argument("--moog-port", default=DEFAULT_MOOG_PORT, help=f"Moog Windows COM port. Default: {DEFAULT_MOOG_PORT}.")
+    parser.add_argument("--moog-move-timeout", type=float, default=30.0, help="Max seconds to wait for each Moog move. Default: 30.")
     parser.add_argument(
         "--moog-command",
         help="Command template for --moog-mode command, for example: py move_moog.py --pan {pan}",
@@ -530,6 +473,10 @@ def main() -> None:
         return
 
     print(f"Scan points: {len(sequence)}")
+    print(f"PRO3600 port: {args.level_port}")
+    print(f"Moog mode: {args.moog_mode}")
+    if args.moog_mode == "moog-functions":
+        print(f"Moog port: {args.moog_port}")
     print(f"Output CSV: {csv_path}")
 
     moog = build_moog_backend(args)
@@ -577,6 +524,9 @@ def main() -> None:
             "settle_seconds": args.settle,
             "sample_seconds": args.sample_seconds,
             "tilt_deg": args.tilt,
+            "level_port": args.level_port,
+            "moog_mode": args.moog_mode,
+            "moog_port": args.moog_port if args.moog_mode == "moog-functions" else None,
         },
         "fit": fit,
         "files": {
