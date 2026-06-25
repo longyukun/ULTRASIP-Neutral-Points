@@ -149,9 +149,34 @@ def select_tilt(attrs):
 
 def process_level1(handle):
     names = acquisition_names(handle)
-    sza0 = None
-    x_center = None
-    y_center = None
+
+    # Geometry anchor: image centre (fixed for all frames).
+    # This keeps Level 1 geometry clean so that v1/v2/v3/v4 pointing
+    # corrections can each make a single uniform shift without double-counting.
+    # At the image centre pixel, view_zen = 90 - Tilt and view_az = Pan.
+    x_center = IMG_X / 2.0
+    y_center = IMG_Y / 2.0
+
+    # Detect sun centroid from aqnum_0 and store as metadata only.
+    # It is NOT used as the geometry anchor here; use compute_pointing_calibration_v1.py
+    # to turn per-frame sun centroids into a pointing correction (v1).
+    aq0 = handle.get("Aquistion_0")
+    if aq0 is not None and "UV Image Data" in aq0 and "I_corrected" in aq0["UV Image Data"]:
+        sun_cx, sun_cy = find_sun_center(aq0["UV Image Data"]["I_corrected"][:])
+    else:
+        sun_cx, sun_cy = x_center, y_center
+    handle["Measurement_Metadata"].attrs["Sun Center Pixel aq0 (x,y)"] = np.array(
+        [sun_cx, sun_cy])
+
+    # Document naming conventions in HDF5 metadata.
+    meta = handle["Measurement_Metadata"].attrs
+    meta["Geometry Reference Origin"] = "Image centre (IMG_X/2, IMG_Y/2)"
+    meta["View Zenith Convention"] = (
+        "Sky zenith angle [deg]; 0=overhead; 90=horizon; "
+        "value at image centre pixel = 90 - Moog Tilt")
+    meta["View Azimuth Convention"] = (
+        "Moog Pan coordinates [deg]; Pan=0 points due South; "
+        "North-based meteorological azimuth = (view_az + 180) % 360")
 
     for idx, name in enumerate(names):
         print(f"Level 1: {name}", flush=True)
@@ -168,14 +193,11 @@ def process_level1(handle):
         aq.attrs["Geometry Sun Altitude Drift Correction"] = "disabled"
         aq.attrs["Geometry Pan Used [deg]"] = float(pan)
         aq.attrs["Geometry Tilt Used [deg]"] = float(tilt)
+        # Store the Moog boresight direction for this frame (image-centre sky coords).
+        aq.attrs["Geometry Zenith Center [deg]"] = float(90.0 - tilt)
+        aq.attrs["Geometry Az Center [deg]"] = float(pan)
 
-        if idx == 0:
-            intensity = uv_data["I_corrected"][:]
-            x_center, y_center = find_sun_center(intensity)
-            sza0 = sun_alt_attr
-            handle["Measurement_Metadata"].attrs["Center Pixel (x,y)"] = np.array(
-                [x_center, y_center])
-
+        # sza0 = sun_alt_attr per frame → delta_zen = 0 (no drift correction).
         view_az, view_zen, sun_az, sun_zen = pixel_geometry(
             sun_alt_attr,
             HFOV,

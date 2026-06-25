@@ -872,25 +872,26 @@ class RobustNPQtApp(QMainWindow):
         self.tilt_corr_label = QLabel("Tilt corr: ---")
         self.tilt_corr_label.setMinimumWidth(130)
 
-        self.apply_roll_rotation_check = QCheckBox("Apply v2 (roll + zenith/az)")
-        self.apply_roll_rotation_check.setToolTip(
-            "Apply the per-frame v2 pointing calibration (Pointing_Calibration_v2):\n"
-            " - Rotate Q/I and U/I in Stokes space by theta = 'Camera Roll v2 [deg]'\n"
-            "   using R(theta) = [[cos, -sin], [sin, cos]]\n"
-            " - Shift view_zen by 'Tilt Error v2 Pred [deg]' and view_az by\n"
-            "   'Pan_v2 [deg]' - 'Geometry Pan Used [deg]'")
-        self.roll_rotation_label = QLabel("Roll: ---")
-        self.roll_rotation_label.setMinimumWidth(110)
-
-        self.apply_v3_check = QCheckBox("Apply v3 (file calib only)")
-        self.apply_v3_check.setToolTip(
-            "Apply the per-file v3 pointing calibration (this file's own calibration\n"
-            "frames only, no cross-file sinusoid):\n"
-            " - Shift view_zen by 'Tilt Error v3 Pred [deg]'\n"
-            " - No Q/U rotation and no azimuth shift (camera_roll_v3 = 0,\n"
-            "   pan_v3 = pan_raw)")
-        self.v3_label = QLabel("v3: ---")
-        self.v3_label.setMinimumWidth(110)
+        self.pointing_version_combo = QComboBox()
+        self.pointing_version_combo.addItem("None", userData=None)
+        self.pointing_version_combo.addItem("v1 sun centroid", userData="v1")
+        self.pointing_version_combo.addItem("v2 folder sinusoid", userData="v2")
+        self.pointing_version_combo.addItem("v2b raw aq0 sinusoid", userData="v2b")
+        self.pointing_version_combo.addItem("v3 file calibration", userData="v3")
+        self.pointing_version_combo.addItem("v4 raster calibration", userData="v4")
+        self.pointing_version_combo.setToolTip(
+            "Select one mutually exclusive pointing correction.\n"
+            "v1: per-frame sun-centroid shift (this file only).\n"
+            "v2: folder-wide calibration-frame sinusoid.\n"
+            "v2b: folder-wide Aquistion_0 raw sun-center sinusoid.\n"
+            "v3: this file's calibration tilt error, reusing v2 pan/roll.\n"
+            "v4: raster calibration with geometry-grid rotation.")
+        self.pointing_version_label = QLabel("Pointing: none")
+        self.pointing_version_label.setMinimumWidth(240)
+        self.process_pointing_button = QPushButton("Process selected")
+        self.process_pointing_button.setToolTip(
+            "Compute the selected pointing correction from this file's folder, "
+            "but write attributes only to the currently opened H5.")
 
         controls_row1 = QHBoxLayout()
         controls_row1.addWidget(self.open_button)
@@ -920,11 +921,10 @@ class RobustNPQtApp(QMainWindow):
         controls_row2.addWidget(self.tilt_corr_label)
         controls_row2.addWidget(self.apply_tilt_corr_check)
         controls_row2.addSpacing(12)
-        controls_row2.addWidget(self.roll_rotation_label)
-        controls_row2.addWidget(self.apply_roll_rotation_check)
-        controls_row2.addSpacing(12)
-        controls_row2.addWidget(self.v3_label)
-        controls_row2.addWidget(self.apply_v3_check)
+        controls_row2.addWidget(QLabel("Pointing correction"))
+        controls_row2.addWidget(self.pointing_version_combo)
+        controls_row2.addWidget(self.process_pointing_button)
+        controls_row2.addWidget(self.pointing_version_label)
         controls_row2.addStretch(1)
 
         self.figure = Figure(figsize=(19, 11), constrained_layout=True)
@@ -953,10 +953,8 @@ class RobustNPQtApp(QMainWindow):
         self.stitch_priority_combo.currentIndexChanged.connect(self.clear_panorama_and_redraw)
         self.sigma_spin.valueChanged.connect(self.clear_cache_and_redraw)
         self.apply_tilt_corr_check.stateChanged.connect(self.clear_cache_and_redraw)
-        self.apply_roll_rotation_check.stateChanged.connect(self.clear_cache_and_redraw)
-        self.apply_roll_rotation_check.toggled.connect(self._on_v2_toggled)
-        self.apply_v3_check.stateChanged.connect(self.clear_cache_and_redraw)
-        self.apply_v3_check.toggled.connect(self._on_v3_toggled)
+        self.pointing_version_combo.currentIndexChanged.connect(self.clear_cache_and_redraw)
+        self.process_pointing_button.clicked.connect(self.process_selected_pointing_correction)
 
         if initial_h5:
             self.load_h5(initial_h5)
@@ -1019,6 +1017,64 @@ class RobustNPQtApp(QMainWindow):
 
         self.copy_jpg_button.setText("Copied JPG 200dpi")
         self.statusBar().showMessage(f"Copied 200 dpi JPG to clipboard: {out_path}", 5000)
+
+    def process_selected_pointing_correction(self):
+        if not self.h5_path:
+            QMessageBox.warning(self, "No H5", "Open an H5 file first.")
+            return
+
+        version = self._active_version()
+        if version is None:
+            QMessageBox.warning(
+                self,
+                "No correction selected",
+                "Select v2, v2b, v3, or v4 from the Pointing correction menu first.")
+            return
+
+        directory = os.path.dirname(self.h5_path)
+        current_index = self.combo.currentIndex()
+        env = os.environ.copy()
+        mpl_dir = os.path.join("/private/tmp", "ultrasip_matplotlib")
+        os.makedirs(mpl_dir, exist_ok=True)
+        env.setdefault("MPLCONFIGDIR", mpl_dir)
+
+        if version == "v1":
+            script = os.path.join(script_dir(), "compute_pointing_calibration_v1.py")
+            command = [sys.executable, script, self.h5_path]
+        elif version in ("v2", "v3"):
+            script = os.path.join(script_dir(), "compute_pointing_calibration_v2.py")
+            command = [sys.executable, script, directory, "--only-file", self.h5_path]
+        elif version == "v2b":
+            script = os.path.join(script_dir(), "compute_pointing_calibration_v2b.py")
+            command = [sys.executable, script, directory, "--only-file", self.h5_path]
+        elif version == "v4":
+            script = os.path.join(script_dir(), "apply_calibration_v4.py")
+            command = [sys.executable, script, directory, "--only-file", self.h5_path]
+        else:
+            QMessageBox.warning(self, "Unsupported correction", f"Unsupported version: {version}")
+            return
+
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                env=env,
+            )
+        except subprocess.CalledProcessError as exc:
+            message = str(exc)
+            QMessageBox.critical(self, f"{version} processing failed", message)
+            self.initial_index = int(np.clip(current_index, 0, max(len(self.names) - 1, 0)))
+            self.load_h5(self.h5_path)
+            return
+
+        self.initial_index = int(np.clip(current_index, 0, max(len(self.names) - 1, 0)))
+        self.load_h5(self.h5_path)
+        self.statusBar().showMessage(
+            f"Processed {version} for {os.path.basename(self.h5_path)}", 7000)
 
     def load_h5(self, path):
         if self.handle is not None:
@@ -1437,25 +1493,29 @@ class RobustNPQtApp(QMainWindow):
             roll = np.nan
         return roll
 
-    def _geometry_shift_deg(self, aq_name, version):
-        """Return (zen_shift_deg, az_shift_deg) to convert raw view_zen/view_az to vN."""
+    def _geometry_shift_deg_raw(self, aq_name, version):
+        """Return raw (zen_shift_deg, az_shift_deg), preserving NaN for display."""
         try:
             attrs = self.handle[aq_name].attrs
             zen_shift = float(attrs.get(f"Tilt Error {version} Pred [deg]", np.nan))
             pan_vn = float(attrs.get(f"Pan_{version} [deg]", np.nan))
             pan_raw = float(attrs.get("Geometry Pan Used [deg]", np.nan))
         except Exception:
-            return 0.0, 0.0
+            return np.nan, np.nan
+        az_shift = (pan_vn - pan_raw) if np.isfinite(pan_vn) and np.isfinite(pan_raw) else np.nan
+        return zen_shift, az_shift
+
+    def _geometry_shift_deg(self, aq_name, version):
+        """Return (zen_shift_deg, az_shift_deg) to convert raw view_zen/view_az to vN."""
+        zen_shift, az_shift = self._geometry_shift_deg_raw(aq_name, version)
         zen_shift = zen_shift if np.isfinite(zen_shift) else 0.0
-        az_shift = (pan_vn - pan_raw) if np.isfinite(pan_vn) and np.isfinite(pan_raw) else 0.0
+        az_shift = az_shift if np.isfinite(az_shift) else 0.0
         return zen_shift, az_shift
 
     def _active_version(self):
-        """Return 'v2', 'v3', or None depending on which checkbox is active."""
-        if self.apply_roll_rotation_check.isChecked():
-            return "v2"
-        if self.apply_v3_check.isChecked():
-            return "v3"
+        """Return 'v2', 'v2b', 'v3', 'v4', or None depending on the dropdown."""
+        if hasattr(self, "pointing_version_combo"):
+            return self.pointing_version_combo.currentData()
         return None
 
     def _active_roll_deg(self, aq_name):
@@ -1472,17 +1532,19 @@ class RobustNPQtApp(QMainWindow):
             return 0.0, 0.0
         return self._geometry_shift_deg(aq_name, version)
 
-    def _update_roll_rotation_label(self, aq_name):
-        roll = self._roll_deg(aq_name, "v2")
-        if np.isfinite(roll):
-            self.roll_rotation_label.setText(f"Roll: {roll:+.4f}°")
+    def _update_pointing_version_label(self, aq_name):
+        version = self._active_version()
+        if version is None:
+            self.pointing_version_label.setText("Pointing: none")
+            return
+        zen_shift, az_shift = self._geometry_shift_deg_raw(aq_name, version)
+        roll = self._roll_deg(aq_name, version)
+        if np.isfinite(zen_shift) or np.isfinite(az_shift) or np.isfinite(roll):
+            self.pointing_version_label.setText(
+                f"{version}: zen {zen_shift:+.4f}° az {az_shift:+.4f}° roll {roll:+.3f}°"
+            )
         else:
-            self.roll_rotation_label.setText("Roll: n/a")
-        v3_zen = self._zen_shift_deg(aq_name, "v3")
-        if np.isfinite(v3_zen):
-            self.v3_label.setText(f"v3: {v3_zen:+.4f}°")
-        else:
-            self.v3_label.setText("v3: n/a")
+            self.pointing_version_label.setText(f"{version}: n/a")
 
     def _zen_shift_deg(self, aq_name, version):
         try:
@@ -1491,30 +1553,48 @@ class RobustNPQtApp(QMainWindow):
             shift = np.nan
         return shift
 
-    def _on_v2_toggled(self, checked):
-        if checked and self.apply_v3_check.isChecked():
-            self.apply_v3_check.blockSignals(True)
-            self.apply_v3_check.setChecked(False)
-            self.apply_v3_check.blockSignals(False)
-            self.clear_cache_and_redraw()
+    def _active_geometry_roll_deg(self, aq_name):
+        """Grid rotation applied to view_az/view_zen (v4 only).
 
-    def _on_v3_toggled(self, checked):
-        if checked and self.apply_roll_rotation_check.isChecked():
-            self.apply_roll_rotation_check.blockSignals(True)
-            self.apply_roll_rotation_check.setChecked(False)
-            self.apply_roll_rotation_check.blockSignals(False)
-            self.clear_cache_and_redraw()
+        The v4 calibration shows the mount raster rotated by the camera roll in
+        the image, so the pixel->sky mapping is corrected by rotating the
+        (az, alt) offsets about the geometry anchor by +roll (counter-clockwise
+        in the (az, alt-up) frame); the rotation part of -inv(M) @ diag(1, -1)
+        equals the stored 'Camera Roll v4 [deg]'.
+        """
+        if self._active_version() != "v4":
+            return 0.0
+        roll = self._roll_deg(aq_name, "v4")
+        return float(roll) if np.isfinite(roll) else 0.0
+
+    def _geometry_anchor(self, aq_name):
+        attrs = self.handle[aq_name].attrs
+        az_c = float(attrs.get("Geometry Pan Used [deg]", np.nan))
+        tilt_c = float(attrs.get("Geometry Tilt Used [deg]", np.nan))
+        return az_c, 90.0 - tilt_c
 
     def get_products(self, aq_name):
         corr = self._active_tilt_correction_deg()
         roll = self._active_roll_deg(aq_name)
+        geom_roll = self._active_geometry_roll_deg(aq_name)
         zen_shift, az_shift = self._active_geometry_shift(aq_name)
         key = (
             aq_name, self.sigma_spin.value(), round(corr, 6),
             round(roll, 6), round(zen_shift, 6), round(az_shift, 6),
+            round(geom_roll, 6),
         )
         if key not in self.cache:
             products = load_products(self.handle, aq_name, self.sigma_spin.value())
+            if geom_roll != 0.0:
+                az_c, zen_c = self._geometry_anchor(aq_name)
+                if np.isfinite(az_c) and np.isfinite(zen_c):
+                    theta = np.radians(geom_roll)
+                    cos_t, sin_t = np.cos(theta), np.sin(theta)
+                    az_off = products["view_az"] - az_c
+                    up_off = zen_c - products["view_zen"]
+                    products = dict(products)
+                    products["view_az"] = az_c + cos_t * az_off - sin_t * up_off
+                    products["view_zen"] = zen_c - (sin_t * az_off + cos_t * up_off)
             if corr != 0.0:
                 products = dict(products)
                 products["view_zen"] = products["view_zen"] - corr
@@ -1863,7 +1943,7 @@ class RobustNPQtApp(QMainWindow):
         aq_name = self.current_name()
         if not aq_name:
             return
-        self._update_roll_rotation_label(aq_name)
+        self._update_pointing_version_label(aq_name)
         products = self.get_products(aq_name)
         row, selected = self.current_np(aq_name)
         q = products["q"]

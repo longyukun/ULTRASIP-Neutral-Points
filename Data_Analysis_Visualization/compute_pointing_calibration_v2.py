@@ -1,11 +1,36 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 from datetime import datetime
+import os
 from pathlib import Path
 
 import h5py
 import numpy as np
 from scipy.optimize import curve_fit
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable is not None else _NullProgress()
+
+
+class _NullProgress:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def update(self, n=1):
+        pass
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
 from robust_np_all_acquisitions import (
     UV_DEG_PER_PIXEL,
@@ -16,11 +41,20 @@ from robust_np_all_acquisitions import (
 )
 
 
-DEFAULT_DIR = Path("/Volumes/LaCie/Level2 data/2026_06_05")
+DEFAULT_DIR = Path("/Volumes/LaCie/Level2 data/2026_06_10")
+
+
+def default_worker_count(item_count):
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(item_count, max(1, cpu_count - 2)))
 
 
 def is_real_h5(path):
     return path.is_file() and path.suffix.lower() in (".h5", ".hdf5") and not path.name.startswith("._")
+
+
+def is_measurement_h5(path):
+    return is_real_h5(path) and not path.name.endswith("_calibration.h5")
 
 
 def parse_timestamp(attrs):
@@ -101,6 +135,11 @@ def calibration_point(handle):
     }
 
 
+def calibration_point_for_path(path):
+    with h5py.File(path, "r") as handle:
+        return calibration_point(handle)
+
+
 def sinusoid(pan_deg, A, phi, C):
     return A * np.sin(np.radians(pan_deg) + phi) + C
 
@@ -168,11 +207,13 @@ def write_frame_attrs(grp, values):
     grp.attrs["Tilt Error v2 Pred [deg]"] = values["tilt_err_pred_deg"]
     grp.attrs["Tilt_v2 [deg]"] = values["tilt_v2_deg"]
     grp.attrs["Zenith_v2 [deg]"] = values["zenith_v2_deg"]
+    grp.attrs["Az_v2 [deg]"] = values["pan_v2_deg"]   # corrected az at image centre
     grp.attrs["Pan_v2 [deg]"] = values["pan_v2_deg"]
     grp.attrs["Camera Roll v2 [deg]"] = values["camera_roll_v2_deg"]
     grp.attrs["Tilt Error v3 Pred [deg]"] = values["tilt_err_v3_deg"]
     grp.attrs["Tilt_v3 [deg]"] = values["tilt_v3_deg"]
     grp.attrs["Zenith_v3 [deg]"] = values["zenith_v3_deg"]
+    grp.attrs["Az_v3 [deg]"] = values["pan_v3_deg"]   # corrected az at image centre
     grp.attrs["Pan_v3 [deg]"] = values["pan_v3_deg"]
     grp.attrs["Camera Roll v3 [deg]"] = values["camera_roll_v3_deg"]
 
@@ -196,6 +237,36 @@ def write_calibration_group(handle, A, phi, C, delta_pitch, delta_roll, r2, n_po
     g.attrs["this_file_calibration_n_total"] = point["n_total"]
 
 
+def process_one_file(path, point, A, phi, C, delta_pitch, delta_roll,
+                     r2, n_points, dry_run=False, position=1):
+    mode = "r" if dry_run else "r+"
+    per_frame_rows = []
+    with h5py.File(path, mode) as handle:
+        names = acquisition_names(handle)
+        calib_names = sorted(n for n in handle.keys() if n.startswith("calibration_acqui_"))
+        frame_names = names + calib_names
+        tilt_err_v3 = point["tilt_err_deg"] if point is not None else float("nan")
+        iterator = tqdm(
+            frame_names,
+            desc=f"{path.name}",
+            unit="frame",
+            position=position,
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for name in iterator:
+            grp = handle[name]
+            values = apply_frame_correction(grp.attrs, A, phi, C, delta_roll, tilt_err_v3)
+            if not dry_run:
+                write_frame_attrs(grp, values)
+            row = {"h5_file": path.name, "acquisition": name}
+            row.update(values)
+            per_frame_rows.append(row)
+        if not dry_run and point is not None:
+            write_calibration_group(handle, A, phi, C, delta_pitch, delta_roll, r2, n_points, point)
+    return per_frame_rows, len(frame_names)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -208,6 +279,18 @@ def parse_args():
     )
     parser.add_argument("directory", nargs="?", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--dry-run", action="store_true", help="Compute and report only; do not modify H5 files")
+    parser.add_argument(
+        "--only-file",
+        type=Path,
+        default=None,
+        help="Write v2/v3 attributes only to this H5 file; folder-wide fit still uses all usable H5 files.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Worker threads. Default: max(1, CPU count - 2), capped by file count.",
+    )
     return parser.parse_args()
 
 
@@ -217,23 +300,55 @@ def main():
     if not directory.exists() or not directory.is_dir():
         raise SystemExit(f"Directory does not exist: {directory}")
 
-    files = sorted(p for p in directory.iterdir() if is_real_h5(p))
+    files = sorted(p for p in directory.iterdir() if is_measurement_h5(p))
     if not files:
         raise SystemExit(f"No H5 files in {directory}")
+    target_files = files
+    if args.only_file is not None:
+        only = args.only_file.expanduser()
+        if not only.is_absolute():
+            only = directory / only
+        only = only.resolve()
+        target_files = [p for p in files if p.resolve() == only]
+        if not target_files:
+            raise SystemExit(f"--only-file is not a measurement H5 in {directory}: {only}")
+    workers = (
+        max(1, min(args.workers, len(files)))
+        if args.workers and args.workers > 0
+        else default_worker_count(len(files))
+    )
+    target_workers = max(1, min(workers, len(target_files)))
+    print(
+        f"Using {workers} worker(s) for fit points and {target_workers} worker(s) for writes",
+        flush=True,
+    )
 
     points = {}
-    for path in files:
-        with h5py.File(path, "r") as handle:
-            point = calibration_point(handle)
-        if point is None:
-            print(f"WARNING: no usable calibration point for {path.name}", flush=True)
-            continue
-        points[path] = point
-        print(
-            f"{path.name}: pan={point['pan_deg']:.3f} deg  tilt_err={point['tilt_err_deg']:.4f} deg  "
-            f"source={point['source']} ({point['n_used']}/{point['n_total']})",
-            flush=True,
-        )
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_path = {executor.submit(calibration_point_for_path, path): path for path in files}
+        for future in tqdm(
+            as_completed(future_to_path),
+            total=len(future_to_path),
+            desc="Fit points",
+            unit="file",
+            position=0,
+            dynamic_ncols=True,
+        ):
+            path = future_to_path[future]
+            try:
+                point = future.result()
+            except Exception as exc:
+                print(f"WARNING: failed calibration point for {path.name}: {exc}", flush=True)
+                continue
+            if point is None:
+                print(f"WARNING: no usable calibration point for {path.name}", flush=True)
+                continue
+            points[path] = point
+            print(
+                f"{path.name}: pan={point['pan_deg']:.3f} deg  tilt_err={point['tilt_err_deg']:.4f} deg  "
+                f"source={point['source']} ({point['n_used']}/{point['n_total']})",
+                flush=True,
+            )
 
     if len(points) < 3:
         raise SystemExit("Not enough calibration points to fit sinusoid (need >= 3)")
@@ -252,45 +367,71 @@ def main():
     print(f"delta_pitch={delta_pitch:.4f} deg  delta_roll={delta_roll:.4f} deg", flush=True)
 
     fit_csv = directory / "pointing_calibration_v2_fit.csv"
-    with open(fit_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["h5_file", "pan_deg", "tilt_err_deg", "source", "n_used", "n_total"])
-        for path, point in points.items():
-            writer.writerow([
-                path.name, point["pan_deg"], point["tilt_err_deg"],
-                point["source"], point["n_used"], point["n_total"],
-            ])
-        writer.writerow([])
-        writer.writerow(["A_deg", "phi_deg", "C_deg", "delta_pitch_deg", "delta_roll_deg", "r2", "n_points"])
-        writer.writerow([A, np.degrees(phi), C, delta_pitch, delta_roll, r2, len(points)])
-    print(f"Wrote {fit_csv}", flush=True)
+    if not args.dry_run:
+        with open(fit_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["h5_file", "pan_deg", "tilt_err_deg", "source", "n_used", "n_total"])
+            for path, point in points.items():
+                writer.writerow([
+                    path.name, point["pan_deg"], point["tilt_err_deg"],
+                    point["source"], point["n_used"], point["n_total"],
+                ])
+            writer.writerow([])
+            writer.writerow(["A_deg", "phi_deg", "C_deg", "delta_pitch_deg", "delta_roll_deg", "r2", "n_points"])
+            writer.writerow([A, np.degrees(phi), C, delta_pitch, delta_roll, r2, len(points)])
+        print(f"Wrote {fit_csv}", flush=True)
+    else:
+        print(f"Dry run: not writing {fit_csv}", flush=True)
 
     per_frame_rows = []
-    for path in files:
-        mode = "r" if args.dry_run else "r+"
-        with h5py.File(path, mode) as handle:
-            point = points.get(path)
-            names = acquisition_names(handle)
-            calib_names = sorted(n for n in handle.keys() if n.startswith("calibration_acqui_"))
-            tilt_err_v3 = point["tilt_err_deg"] if point is not None else float("nan")
-            for name in names + calib_names:
-                grp = handle[name]
-                values = apply_frame_correction(grp.attrs, A, phi, C, delta_roll, tilt_err_v3)
-                if not args.dry_run:
-                    write_frame_attrs(grp, values)
-                row = {"h5_file": path.name, "acquisition": name}
-                row.update(values)
-                per_frame_rows.append(row)
-            if not args.dry_run and point is not None:
-                write_calibration_group(handle, A, phi, C, delta_pitch, delta_roll, r2, len(points), point)
-        print(f"Processed {path.name} ({len(names) + len(calib_names)} frames)", flush=True)
+    write_inputs = [(path, points.get(path), idx + 1) for idx, path in enumerate(target_files)]
+    with ThreadPoolExecutor(max_workers=target_workers) as executor:
+        future_to_path = {
+            executor.submit(
+                process_one_file,
+                path,
+                point,
+                A,
+                phi,
+                C,
+                delta_pitch,
+                delta_roll,
+                r2,
+                len(points),
+                args.dry_run,
+                position,
+            ): path
+            for path, point, position in write_inputs
+        }
+        for future in tqdm(
+            as_completed(future_to_path),
+            total=len(future_to_path),
+            desc="Write files",
+            unit="file",
+            position=0,
+            dynamic_ncols=True,
+        ):
+            path = future_to_path[future]
+            try:
+                rows, frame_count = future.result()
+            except BlockingIOError:
+                print(f"{path.name}: SKIPPED - file is open in another program (close it and rerun)", flush=True)
+                continue
+            except Exception as exc:
+                print(f"{path.name}: FAILED - {exc}", flush=True)
+                continue
+            per_frame_rows.extend(rows)
+            print(f"Processed {path.name} ({frame_count} frames)", flush=True)
 
     per_frame_csv = directory / "pointing_calibration_v2_per_frame.csv"
-    with open(per_frame_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(per_frame_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(per_frame_rows)
-    print(f"Wrote {per_frame_csv}", flush=True)
+    if per_frame_rows and not args.dry_run:
+        with open(per_frame_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(per_frame_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(per_frame_rows)
+        print(f"Wrote {per_frame_csv}", flush=True)
+    elif args.dry_run:
+        print(f"Dry run: not writing {per_frame_csv}", flush=True)
 
 
 if __name__ == "__main__":
