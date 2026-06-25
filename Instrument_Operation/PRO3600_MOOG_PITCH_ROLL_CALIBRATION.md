@@ -15,6 +15,21 @@ The default scan is:
 
 with 5 degree pan steps, 2 seconds settle time at each point, repeated 3 times.
 
+## Quick Run
+
+On the Windows computer connected to the Moog and PRO3600:
+
+```bat
+cd path\to\ULTRASIP-Neutral-Points\Instrument_Operation
+py -m pip install pyserial matplotlib
+py pro3600_moog_pitch_roll_calibration.py --list-ports
+py pro3600_moog_pitch_roll_calibration.py --plan-only
+py pro3600_moog_pitch_roll_calibration.py --level-port COM3 --moog-port COM7 --output-dir calibration_outputs
+```
+
+Replace `COM3` with the PRO3600 level serial port.  Replace `COM7` with the
+Moog serial port; `COM7` is the current default used by `Measurement_QT_GUI.py`.
+
 ## 1. Install dependency on the Windows Moog computer
 
 ```bat
