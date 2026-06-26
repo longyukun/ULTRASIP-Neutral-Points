@@ -44,7 +44,7 @@ except ImportError:
     serial = None
 
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 PAN_MIN_DEG = -217.5
 PAN_MAX_DEG = 217.5
 TILT_MIN_DEG = -90.0
@@ -104,6 +104,135 @@ def moog_command_pointing(pan_deg: float, tilt_deg: float) -> Tuple[float, float
     """Return the positions represented by the integer Moog command units."""
     pan, tilt = clamp_pointing(pan_deg, tilt_deg)
     return int(pan * 10) / 10.0, int(tilt * 10) / 10.0
+
+
+def level_compensation_terms(
+    pan_deg: float,
+    tilt_deg: float,
+    offset_deg: float,
+    pitch_cos_coeff_deg: float,
+    roll_sin_coeff_deg: float,
+) -> dict:
+    """Return pointing corrections from the PRO3600 sinusoidal level fit.
+
+    The calibration script fits:
+        level_angle = offset + pitch*cos(pan) + roll*sin(pan)
+
+    Here that fitted level angle is treated as the tilt/altitude error at the
+    current Moog pan.  The camera roll is the derivative of that sinusoid with
+    respect to pan, projected by cos(tilt), matching the downstream v2 geometry
+    convention used by the analysis tools.
+    """
+    pan_rad = math.radians(float(pan_deg))
+    cos_tilt = math.cos(math.radians(float(tilt_deg)))
+    if abs(cos_tilt) < 1e-6:
+        cos_tilt = 1e-6 if cos_tilt >= 0 else -1e-6
+
+    pitch = float(pitch_cos_coeff_deg)
+    roll = float(roll_sin_coeff_deg)
+    tilt_error = float(offset_deg) + pitch * math.cos(pan_rad) + roll * math.sin(pan_rad)
+    pan_error = pitch * math.cos(pan_rad) / cos_tilt
+    camera_roll = (-pitch * math.sin(pan_rad) + roll * math.cos(pan_rad)) / cos_tilt
+    return {
+        "tilt_error_deg": float(tilt_error),
+        "pan_error_deg": float(pan_error),
+        "camera_roll_deg": float(camera_roll),
+    }
+
+
+def compensated_moog_command(requested_pan_deg: float, requested_tilt_deg: float, config: dict):
+    """Return (target_pan, target_tilt, command_correction) for a desired pointing."""
+    if not config.get("level_compensation_enabled", False):
+        target_pan, target_tilt = moog_command_pointing(requested_pan_deg, requested_tilt_deg)
+        return target_pan, target_tilt, {
+            "pan_error_deg": 0.0,
+            "tilt_error_deg": 0.0,
+            "camera_roll_deg": 0.0,
+        }
+
+    command_pan = float(requested_pan_deg)
+    command_tilt = float(requested_tilt_deg)
+    terms = {
+        "pan_error_deg": 0.0,
+        "tilt_error_deg": 0.0,
+        "camera_roll_deg": 0.0,
+    }
+    for _ in range(2):
+        terms = level_compensation_terms(
+            command_pan,
+            command_tilt,
+            config.get("level_compensation_offset_deg", 0.0),
+            config.get("level_compensation_pitch_deg", 0.0),
+            config.get("level_compensation_roll_deg", 0.0),
+        )
+        command_pan = float(requested_pan_deg) - terms["pan_error_deg"]
+        command_tilt = float(requested_tilt_deg) - terms["tilt_error_deg"]
+
+    target_pan, target_tilt = moog_command_pointing(command_pan, command_tilt)
+    terms = level_compensation_terms(
+        target_pan,
+        target_tilt,
+        config.get("level_compensation_offset_deg", 0.0),
+        config.get("level_compensation_pitch_deg", 0.0),
+        config.get("level_compensation_roll_deg", 0.0),
+    )
+    return target_pan, target_tilt, terms
+
+
+def level_corrected_geometry(status, config: dict) -> dict:
+    """Compute corrected geometry from actual Moog output and level calibration."""
+    pan_raw = float(status.pan_deg)
+    tilt_raw = float(status.tilt_deg)
+    if config.get("level_compensation_enabled", False):
+        terms = level_compensation_terms(
+            pan_raw,
+            tilt_raw,
+            config.get("level_compensation_offset_deg", 0.0),
+            config.get("level_compensation_pitch_deg", 0.0),
+            config.get("level_compensation_roll_deg", 0.0),
+        )
+    else:
+        terms = {
+            "pan_error_deg": 0.0,
+            "tilt_error_deg": 0.0,
+            "camera_roll_deg": 0.0,
+        }
+    pan_v2 = pan_raw + terms["pan_error_deg"]
+    tilt_v2 = tilt_raw + terms["tilt_error_deg"]
+    return {
+        "pan_raw_deg": pan_raw,
+        "tilt_raw_deg": tilt_raw,
+        "zenith_raw_deg": 90.0 - tilt_raw,
+        "pan_v2_deg": float(pan_v2),
+        "tilt_v2_deg": float(tilt_v2),
+        "zenith_v2_deg": float(90.0 - tilt_v2),
+        "tilt_err_pred_deg": float(terms["tilt_error_deg"]),
+        "pan_err_pred_deg": float(terms["pan_error_deg"]),
+        "camera_roll_v2_deg": float(terms["camera_roll_deg"]),
+    }
+
+
+def write_level_compensation_attrs(attrs, status, config: dict, prefix: str = ""):
+    values = level_corrected_geometry(status, config)
+    key_prefix = f"{prefix} " if prefix else ""
+    attrs[f"{key_prefix}Level Compensation Enabled"] = int(config.get("level_compensation_enabled", False))
+    attrs[f"{key_prefix}Level Compensation Model"] = "tilt_error=offset+pitch*cos(pan)+roll*sin(pan)"
+    attrs[f"{key_prefix}Level Compensation Offset [deg]"] = float(config.get("level_compensation_offset_deg", 0.0))
+    attrs[f"{key_prefix}Level Compensation Pitch Cos Coeff [deg]"] = float(config.get("level_compensation_pitch_deg", 0.0))
+    attrs[f"{key_prefix}Level Compensation Roll Sin Coeff [deg]"] = float(config.get("level_compensation_roll_deg", 0.0))
+    attrs[f"{key_prefix}Geometry Pan Raw [deg]"] = values["pan_raw_deg"]
+    attrs[f"{key_prefix}Geometry Tilt Raw [deg]"] = values["tilt_raw_deg"]
+    attrs[f"{key_prefix}Geometry Zenith Raw [deg]"] = values["zenith_raw_deg"]
+    attrs[f"{key_prefix}Level Compensation Pan Error Pred [deg]"] = values["pan_err_pred_deg"]
+    attrs[f"{key_prefix}Tilt Error v2 Pred [deg]"] = values["tilt_err_pred_deg"]
+    attrs[f"{key_prefix}Pan_v2 [deg]"] = values["pan_v2_deg"]
+    attrs[f"{key_prefix}Tilt_v2 [deg]"] = values["tilt_v2_deg"]
+    attrs[f"{key_prefix}Zenith_v2 [deg]"] = values["zenith_v2_deg"]
+    attrs[f"{key_prefix}Camera Roll v2 [deg]"] = values["camera_roll_v2_deg"]
+    if not prefix:
+        attrs["Geometry Pan Used [deg]"] = values["pan_v2_deg"]
+        attrs["Geometry Tilt Used [deg]"] = values["tilt_v2_deg"]
+        attrs["Geometry Zenith Used [deg]"] = values["zenith_v2_deg"]
 
 
 def solar_position_deg(dt: datetime, latitude_deg: float, longitude_deg: float) -> Tuple[float, float]:
@@ -883,6 +1012,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             self.current_output_text = ""
             self.pan_offset = 0.0
             self.tilt_offset = 0.0
+            self.level_compensation_enabled = False
+            self.level_compensation_offset_deg = 0.0
+            self.level_compensation_pitch_deg = 0.0
+            self.level_compensation_roll_deg = 0.0
             self.auto_scan_auto_exposure_enabled = True
             self.scan_order = "zenith_to_sun"
             self.auto_exposure_mode = "median"
@@ -1471,6 +1604,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "pitch_roll_left": self.pitch_roll_left_input.value(),
                 "pitch_roll_right": self.pitch_roll_right_input.value(),
                 "pitch_roll_step": self.pitch_roll_step_input.value(),
+                "level_compensation_enabled": bool(self.level_compensation_enabled),
+                "level_compensation_offset_deg": float(self.level_compensation_offset_deg),
+                "level_compensation_pitch_deg": float(self.level_compensation_pitch_deg),
+                "level_compensation_roll_deg": float(self.level_compensation_roll_deg),
                 "sun_trigger_enabled": bool(self.sun_trigger_enabled),
                 "auto_scan_auto_exposure_enabled": bool(self.auto_scan_auto_exposure_enabled),
                 "auto_exposure_mode": self.auto_exposure_mode,
@@ -1508,6 +1645,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 self.pan_offset = quantize_pointing(settings["pan_offset"])
             if "tilt_offset" in settings:
                 self.tilt_offset = quantize_pointing(settings["tilt_offset"])
+            self.level_compensation_enabled = bool(settings.get("level_compensation_enabled", False))
+            self.level_compensation_offset_deg = float(settings.get("level_compensation_offset_deg", 0.0))
+            self.level_compensation_pitch_deg = float(settings.get("level_compensation_pitch_deg", 0.0))
+            self.level_compensation_roll_deg = float(settings.get("level_compensation_roll_deg", 0.0))
             self.auto_scan_auto_exposure_enabled = bool(settings.get("auto_scan_auto_exposure_enabled", True))
             self.scan_order = str(settings.get("scan_order", "zenith_to_sun"))
             if self.scan_order not in ("sun_to_zenith", "zenith_to_sun"):
@@ -1549,6 +1690,7 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "Location={location}, output={output}\n"
                 "Sun trigger={sun_trigger}; targets {start:.1f}-{end:.1f} deg step {step:.1f}, tol {tol:.2f}, check {interval:d}s\n"
                 "Offsets pan={pan_offset:.2f}, tilt={tilt_offset:.2f}; scan {scan_order}, dtilt start {tilt_start:.1f}, step {tilt_step:.1f}\n"
+                "Level comp={level_comp}; offset={level_offset:+.3f}, pitch={level_pitch:+.3f}, roll={level_roll:+.3f}\n"
                 "Auto exposure: {auto_enabled}, {metric}, min {min_exp:.0f} us, max {max_exp:.0f} us; Polarizer={angles}".format(
                     location=self.location_input.text().strip() or "ULTRASIP",
                     output=self.output_dir_input.text().strip() or os.getcwd(),
@@ -1563,6 +1705,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     scan_order="zenith-to-sun" if self.scan_order == "zenith_to_sun" else "sun-to-zenith",
                     tilt_start=self.start_tilt_input.value(),
                     tilt_step=self.scan_step_tilt_input.value(),
+                    level_comp="ON" if self.level_compensation_enabled else "OFF",
+                    level_offset=self.level_compensation_offset_deg,
+                    level_pitch=self.level_compensation_pitch_deg,
+                    level_roll=self.level_compensation_roll_deg,
                     auto_enabled="ON" if self.auto_scan_auto_exposure_enabled else "OFF",
                     metric=self.auto_exposure_mode,
                     min_exp=AUTO_EXPOSURE_MIN_US,
@@ -1626,29 +1772,77 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             layout.addWidget(tilt_offset, 9, 1)
             fields["tilt_offset"] = tilt_offset
 
-            add_double(10, "start_tilt", "Scan start tilt offset [deg]", self.start_tilt_input, 0.0, 90.0, 1, 0.1)
-            add_double(11, "scan_step_tilt", "Scan step tilt [deg]", self.scan_step_tilt_input, 0.1, 20.0, 1, 0.1)
+            level_compensation_enabled = make_switch("Level Compensation")
+            level_compensation_enabled.setChecked(bool(self.level_compensation_enabled))
+            layout.addWidget(QtWidgets.QLabel("Apply level compensation"), 10, 0)
+            layout.addWidget(level_compensation_enabled, 10, 1)
+            fields["level_compensation_enabled"] = level_compensation_enabled
+
+            def add_value_double(row, key, label, value, min_value, max_value, decimals, step=None):
+                widget = QtWidgets.QDoubleSpinBox()
+                widget.setRange(min_value, max_value)
+                widget.setDecimals(decimals)
+                if step is not None:
+                    widget.setSingleStep(step)
+                widget.setValue(float(value))
+                layout.addWidget(QtWidgets.QLabel(label), row, 0)
+                layout.addWidget(widget, row, 1)
+                fields[key] = widget
+
+            add_value_double(
+                11,
+                "level_compensation_offset_deg",
+                "Level offset [deg]",
+                self.level_compensation_offset_deg,
+                -20.0,
+                20.0,
+                4,
+                0.001,
+            )
+            add_value_double(
+                12,
+                "level_compensation_pitch_deg",
+                "Level pitch cos coeff [deg]",
+                self.level_compensation_pitch_deg,
+                -20.0,
+                20.0,
+                4,
+                0.001,
+            )
+            add_value_double(
+                13,
+                "level_compensation_roll_deg",
+                "Level roll sin coeff [deg]",
+                self.level_compensation_roll_deg,
+                -20.0,
+                20.0,
+                4,
+                0.001,
+            )
+
+            add_double(14, "start_tilt", "Scan start tilt offset [deg]", self.start_tilt_input, 0.0, 90.0, 1, 0.1)
+            add_double(15, "scan_step_tilt", "Scan step tilt [deg]", self.scan_step_tilt_input, 0.1, 20.0, 1, 0.1)
 
             scan_order = QtWidgets.QComboBox()
             scan_order.addItem("Zenith to sun", "zenith_to_sun")
             scan_order.addItem("Sun to zenith", "sun_to_zenith")
             order_index = scan_order.findData(self.scan_order)
             scan_order.setCurrentIndex(max(0, order_index))
-            layout.addWidget(QtWidgets.QLabel("Scan order"), 12, 0)
-            layout.addWidget(scan_order, 12, 1)
+            layout.addWidget(QtWidgets.QLabel("Scan order"), 16, 0)
+            layout.addWidget(scan_order, 16, 1)
             fields["scan_order"] = scan_order
 
             auto_exposure_enabled = make_switch("Auto Exposure")
             auto_exposure_enabled.setChecked(bool(self.auto_scan_auto_exposure_enabled))
-            layout.addWidget(QtWidgets.QLabel("Auto exposure"), 13, 0)
-            layout.addWidget(auto_exposure_enabled, 13, 1)
+            layout.addWidget(QtWidgets.QLabel("Auto exposure"), 17, 0)
+            layout.addWidget(auto_exposure_enabled, 17, 1)
             fields["auto_scan_auto_exposure_enabled"] = auto_exposure_enabled
 
             auto_exposure_mode = QtWidgets.QComboBox()
             auto_exposure_mode.addItems(["Median", "Max"])
             auto_exposure_mode.setCurrentText(self.auto_exposure_mode.title())
-            layout.addWidget(QtWidgets.QLabel("Auto exposure metric"), 14, 0)
-            layout.addWidget(auto_exposure_mode, 14, 1)
+            layout.addWidget(QtWidgets.QLabel("Auto exposure metric"), 18, 0)
+            layout.addWidget(auto_exposure_mode, 18, 1)
             fields["auto_exposure_mode"] = auto_exposure_mode
 
             auto_exposure_max = QtWidgets.QDoubleSpinBox()
@@ -1656,18 +1850,18 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             auto_exposure_max.setDecimals(0)
             auto_exposure_max.setSingleStep(10_000.0)
             auto_exposure_max.setValue(self.auto_exposure_max_us)
-            layout.addWidget(QtWidgets.QLabel("Max exposure [us]"), 15, 0)
-            layout.addWidget(auto_exposure_max, 15, 1)
+            layout.addWidget(QtWidgets.QLabel("Max exposure [us]"), 19, 0)
+            layout.addWidget(auto_exposure_max, 19, 1)
             fields["auto_exposure_max_us"] = auto_exposure_max
 
             polarizer_angles = QtWidgets.QLineEdit(self.polarizer_angles_input.text())
-            layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), 16, 0)
-            layout.addWidget(polarizer_angles, 16, 1)
+            layout.addWidget(QtWidgets.QLabel("Polarizer angles [deg]"), 20, 0)
+            layout.addWidget(polarizer_angles, 20, 1)
             fields["polarizer_angles"] = polarizer_angles
 
             location = QtWidgets.QLineEdit(self.location_input.text())
-            layout.addWidget(QtWidgets.QLabel("Location"), 17, 0)
-            layout.addWidget(location, 17, 1)
+            layout.addWidget(QtWidgets.QLabel("Location"), 21, 0)
+            layout.addWidget(location, 21, 1)
             fields["location"] = location
 
             output_dir = QtWidgets.QLineEdit(self.output_dir_input.text())
@@ -1680,13 +1874,13 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
             output_row = QtWidgets.QHBoxLayout()
             output_row.addWidget(output_dir)
             output_row.addWidget(browse)
-            layout.addWidget(QtWidgets.QLabel("Output folder"), 18, 0)
-            layout.addLayout(output_row, 18, 1)
+            layout.addWidget(QtWidgets.QLabel("Output folder"), 22, 0)
+            layout.addLayout(output_row, 22, 1)
             fields["output_dir"] = output_dir
 
             dialog_buttons = getattr(QtWidgets.QDialogButtonBox, "StandardButton", QtWidgets.QDialogButtonBox)
             buttons = QtWidgets.QDialogButtonBox(dialog_buttons.Save | dialog_buttons.Cancel)
-            layout.addWidget(buttons, 19, 0, 1, 2)
+            layout.addWidget(buttons, 23, 0, 1, 2)
 
             def save_and_close():
                 try:
@@ -1706,6 +1900,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     self.check_interval_input.setValue(fields["check_interval"].value())
                     self.pan_offset = quantize_pointing(fields["pan_offset"].value())
                     self.tilt_offset = quantize_pointing(fields["tilt_offset"].value())
+                    self.level_compensation_enabled = bool(fields["level_compensation_enabled"].isChecked())
+                    self.level_compensation_offset_deg = float(fields["level_compensation_offset_deg"].value())
+                    self.level_compensation_pitch_deg = float(fields["level_compensation_pitch_deg"].value())
+                    self.level_compensation_roll_deg = float(fields["level_compensation_roll_deg"].value())
                     self.start_tilt_input.setValue(fields["start_tilt"].value())
                     self.scan_step_tilt_input.setValue(fields["scan_step_tilt"].value())
                     self.scan_order = str(fields["scan_order"].currentData())
@@ -1769,6 +1967,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "angles": self.polarizer_angles(),
                 "pan_offset": self.pan_offset,
                 "tilt_offset": self.tilt_offset,
+                "level_compensation_enabled": bool(self.level_compensation_enabled),
+                "level_compensation_offset_deg": float(self.level_compensation_offset_deg),
+                "level_compensation_pitch_deg": float(self.level_compensation_pitch_deg),
+                "level_compensation_roll_deg": float(self.level_compensation_roll_deg),
                 "uv_wavelength": "355 FWHM 10nm",
                 "auto_exposure": bool(self.auto_scan_auto_exposure_enabled),
                 "target_median": self.target_median.value(),
@@ -1839,6 +2041,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 "output_dir": self.output_dir_input.text().strip() or os.getcwd(),
                 "pan_offset": self.pan_offset,
                 "tilt_offset": self.tilt_offset,
+                "level_compensation_enabled": bool(self.level_compensation_enabled),
+                "level_compensation_offset_deg": float(self.level_compensation_offset_deg),
+                "level_compensation_pitch_deg": float(self.level_compensation_pitch_deg),
+                "level_compensation_roll_deg": float(self.level_compensation_roll_deg),
                 "up": float(self.pitch_roll_up_input.value()),
                 "down": float(self.pitch_roll_down_input.value()),
                 "left": float(self.pitch_roll_left_input.value()),
@@ -1939,6 +2145,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Longitude"] = str(config["longitude"])
                 meas.attrs["Pan_Offset"] = str(config["pan_offset"])
                 meas.attrs["Tilt_Offset"] = str(config["tilt_offset"])
+                meas.attrs["Level Compensation Enabled"] = int(config.get("level_compensation_enabled", False))
+                meas.attrs["Level Compensation Model"] = "tilt_error=offset+pitch*cos(pan)+roll*sin(pan)"
+                meas.attrs["Level Compensation Offset [deg]"] = float(config.get("level_compensation_offset_deg", 0.0))
+                meas.attrs["Level Compensation Pitch Cos Coeff [deg]"] = float(config.get("level_compensation_pitch_deg", 0.0))
+                meas.attrs["Level Compensation Roll Sin Coeff [deg]"] = float(config.get("level_compensation_roll_deg", 0.0))
                 meas.attrs["Location"] = config["location"]
                 meas.attrs["Purpose"] = "Pitch/Roll pointing calibration raster scan around the sun"
                 meas.attrs["Scan Pattern"] = "row_by_row_top_to_bottom_left_to_right"
@@ -1982,7 +2193,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         tilt = float(sun_altitude) + float(dtilt)
                         requested_pan = pan - config["pan_offset"]
                         requested_tilt = tilt - config["tilt_offset"]
-                        target_pan, target_tilt = moog_command_pointing(requested_pan, requested_tilt)
+                        target_pan, target_tilt, command_level_correction = compensated_moog_command(
+                            requested_pan,
+                            requested_tilt,
+                            config,
+                        )
 
                         with self.motion_lock:
                             arrival_status = self.moog.move_absolute(target_pan, target_tilt)
@@ -2061,13 +2276,20 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                         aq.attrs["Sun Post Capture SZA [deg]"] = 90.0 - float(post_capture_sun_altitude)
                         aq.attrs["Moog Requested Pan [deg]"] = requested_pan
                         aq.attrs["Moog Requested Tilt [deg]"] = requested_tilt
+                        aq.attrs["Moog Commanded Pan [deg]"] = target_pan
+                        aq.attrs["Moog Commanded Tilt [deg]"] = target_tilt
+                        aq.attrs["Level Compensation Command Pan Error [deg]"] = command_level_correction["pan_error_deg"]
+                        aq.attrs["Level Compensation Command Tilt Error [deg]"] = command_level_correction["tilt_error_deg"]
+                        aq.attrs["Level Compensation Command Camera Roll [deg]"] = command_level_correction["camera_roll_deg"]
                         write_pointing_attrs(aq.attrs, moog_status, target_pan, target_tilt)
+                        write_level_compensation_attrs(aq.attrs, moog_status, config)
                         write_post_capture_pointing_attrs(
                             aq.attrs,
                             post_capture_status,
                             target_pan,
                             target_tilt,
                         )
+                        write_level_compensation_attrs(aq.attrs, post_capture_status, config, prefix="Post Capture")
                         if detected_center is not None:
                             aq.attrs["Detected Sun Center X [px]"] = float(detected_center[0])
                             aq.attrs["Detected Sun Center Y [px]"] = float(detected_center[1])
@@ -2355,6 +2577,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                 meas.attrs["Longitude"] = str(config["longitude"])
                 meas.attrs["Pan_Offset"] = str(config["pan_offset"])
                 meas.attrs["Tilt_Offset"] = str(config["tilt_offset"])
+                meas.attrs["Level Compensation Enabled"] = int(config.get("level_compensation_enabled", False))
+                meas.attrs["Level Compensation Model"] = "tilt_error=offset+pitch*cos(pan)+roll*sin(pan)"
+                meas.attrs["Level Compensation Offset [deg]"] = float(config.get("level_compensation_offset_deg", 0.0))
+                meas.attrs["Level Compensation Pitch Cos Coeff [deg]"] = float(config.get("level_compensation_pitch_deg", 0.0))
+                meas.attrs["Level Compensation Roll Sin Coeff [deg]"] = float(config.get("level_compensation_roll_deg", 0.0))
                 meas.attrs["Location"] = config["location"]
                 meas.attrs["Trigger Target Altitude [deg]"] = np.nan if target_altitude is None else float(target_altitude)
                 meas.attrs["Trigger Actual Altitude [deg]"] = np.nan if actual_altitude is None else float(actual_altitude)
@@ -2418,7 +2645,11 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     tilt = initial_tilt_base + float(dtilt)
                     requested_pan = pan - config["pan_offset"]
                     requested_tilt = tilt - config["tilt_offset"]
-                    target_pan, target_tilt = moog_command_pointing(requested_pan, requested_tilt)
+                    target_pan, target_tilt, command_level_correction = compensated_moog_command(
+                        requested_pan,
+                        requested_tilt,
+                        config,
+                    )
 
                     with self.motion_lock:
                         arrival_status = self.moog.move_absolute(target_pan, target_tilt)
@@ -2559,13 +2790,20 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                     aq.attrs["Sun Post Capture SZA [deg]"] = 90.0 - float(post_capture_sun_altitude)
                     aq.attrs["Moog Requested Pan [deg]"] = requested_pan
                     aq.attrs["Moog Requested Tilt [deg]"] = requested_tilt
+                    aq.attrs["Moog Commanded Pan [deg]"] = target_pan
+                    aq.attrs["Moog Commanded Tilt [deg]"] = target_tilt
+                    aq.attrs["Level Compensation Command Pan Error [deg]"] = command_level_correction["pan_error_deg"]
+                    aq.attrs["Level Compensation Command Tilt Error [deg]"] = command_level_correction["tilt_error_deg"]
+                    aq.attrs["Level Compensation Command Camera Roll [deg]"] = command_level_correction["camera_roll_deg"]
                     write_pointing_attrs(aq.attrs, moog_status, target_pan, target_tilt)
+                    write_level_compensation_attrs(aq.attrs, moog_status, config)
                     write_post_capture_pointing_attrs(
                         aq.attrs,
                         post_capture_status,
                         target_pan,
                         target_tilt,
                     )
+                    write_level_compensation_attrs(aq.attrs, post_capture_status, config, prefix="Post Capture")
 
                     uvimg = aq.create_group("UV Image Data")
                     uv_stack = np.stack(uv_frames, axis=0)
@@ -2648,9 +2886,10 @@ def build_app_classes(QtCore, QtGui, QtWidgets):
                             config["longitude"],
                         )
                         wait_pan = azimuth_to_moog_pan(wait_sun_azimuth)
-                        wait_target_pan, wait_target_tilt = moog_command_pointing(
+                        wait_target_pan, wait_target_tilt, _ = compensated_moog_command(
                             wait_pan - config["pan_offset"],
                             zenith_wait_tilt - config["tilt_offset"],
+                            config,
                         )
                         with self.motion_lock:
                             wait_status = self.moog.move_absolute(wait_target_pan, wait_target_tilt)
