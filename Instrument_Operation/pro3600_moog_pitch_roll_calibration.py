@@ -296,28 +296,48 @@ def scan_sequence(step_deg: int, repeats: int) -> list[tuple[int, float]]:
     return sequence
 
 
-def fit_pitch_roll(samples: Iterable[Sample]) -> dict[str, float]:
-    rows = []
-    y = []
-    for sample in samples:
+def fit_pitch_roll(
+    samples: Iterable[Sample],
+    outlier_sigma: float = 4.5,
+    min_outlier_threshold_deg: float = 0.05,
+) -> dict[str, float | list[int]]:
+    sample_list = list(samples)
+    rows: list[list[float]] = []
+    y: list[float] = []
+    for sample in sample_list:
         theta = math.radians(sample.pan_deg)
         rows.append([1.0, math.cos(theta), math.sin(theta)])
         y.append(sample.angle_deg)
 
-    xtx = [[0.0] * 3 for _ in range(3)]
-    xty = [0.0] * 3
-    for row, value in zip(rows, y):
-        for i in range(3):
-            xty[i] += row[i] * value
-            for j in range(3):
-                xtx[i][j] += row[i] * row[j]
+    if len(rows) < 3:
+        raise ValueError("At least three samples are required for the fit.")
 
-    offset, pitch, roll = solve_3x3(xtx, xty)
-    residuals = []
-    for row, value in zip(rows, y):
-        fitted = offset + pitch * row[1] + roll * row[2]
-        residuals.append(value - fitted)
+    active = list(range(len(rows)))
+    for _ in range(10):
+        offset, pitch, roll = least_squares_fit(rows, y, active)
+        residuals = [
+            y[i] - (offset + pitch * rows[i][1] + roll * rows[i][2])
+            for i in active
+        ]
+        residual_center = statistics.median(residuals)
+        mad = statistics.median(abs(r - residual_center) for r in residuals)
+        threshold = max(outlier_sigma * 1.4826 * mad, min_outlier_threshold_deg)
+        next_active = [
+            i for i, residual in zip(active, residuals)
+            if abs(residual - residual_center) <= threshold
+        ]
+        if len(next_active) < 3 or next_active == active:
+            break
+        active = next_active
+
+    offset, pitch, roll = least_squares_fit(rows, y, active)
+    residuals = [
+        y[i] - (offset + pitch * rows[i][1] + roll * rows[i][2])
+        for i in active
+    ]
     rms = math.sqrt(sum(r * r for r in residuals) / len(residuals))
+    active_set = set(active)
+    rejected = [sample_list[i].index for i in range(len(rows)) if i not in active_set]
     return {
         "offset_deg": offset,
         "pitch_deg": pitch,
@@ -326,7 +346,25 @@ def fit_pitch_roll(samples: Iterable[Sample]) -> dict[str, float]:
         "phase_deg": math.degrees(math.atan2(roll, pitch)),
         "rms_residual_deg": rms,
         "n_samples": float(len(y)),
+        "n_samples_used": float(len(active)),
+        "n_outliers_rejected": float(len(rejected)),
+        "rejected_sample_indices": rejected,
     }
+
+
+def least_squares_fit(
+    rows: list[list[float]], y: list[float], indices: list[int]
+) -> tuple[float, float, float]:
+    xtx = [[0.0] * 3 for _ in range(3)]
+    xty = [0.0] * 3
+    for index in indices:
+        row = rows[index]
+        value = y[index]
+        for i in range(3):
+            xty[i] += row[i] * value
+            for j in range(3):
+                xtx[i][j] += row[i] * row[j]
+    return solve_3x3(xtx, xty)
 
 
 def solve_3x3(a: list[list[float]], b: list[float]) -> tuple[float, float, float]:
@@ -368,15 +406,16 @@ def write_csv(path: Path, samples: list[Sample]) -> None:
             )
 
 
-def write_plot(path: Path, samples: list[Sample], fit: dict[str, float]) -> None:
+def write_plot(path: Path, samples: list[Sample], fit: dict[str, float | list[int]]) -> None:
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("matplotlib is not installed; skipping plot output.")
         return
 
-    pans = [s.pan_deg for s in samples]
-    angles = [s.angle_deg for s in samples]
+    rejected = set(fit["rejected_sample_indices"])
+    accepted_samples = [s for s in samples if s.index not in rejected]
+    rejected_samples = [s for s in samples if s.index in rejected]
     grid = [x for x in range(-180, 181)]
     fitted = [
         fit["offset_deg"]
@@ -386,7 +425,22 @@ def write_plot(path: Path, samples: list[Sample], fit: dict[str, float]) -> None
     ]
 
     plt.figure(figsize=(9, 5))
-    plt.scatter(pans, angles, s=12, alpha=0.65, label="PRO3600 readings")
+    plt.scatter(
+        [s.pan_deg for s in accepted_samples],
+        [s.angle_deg for s in accepted_samples],
+        s=12,
+        alpha=0.65,
+        label="PRO3600 readings",
+    )
+    if rejected_samples:
+        plt.scatter(
+            [s.pan_deg for s in rejected_samples],
+            [s.angle_deg for s in rejected_samples],
+            s=32,
+            color="tab:red",
+            marker="x",
+            label="rejected outliers",
+        )
     plt.plot(grid, fitted, color="black", linewidth=2, label="sinusoidal fit")
     plt.xlabel("Moog pan angle (deg)")
     plt.ylabel("PRO3600 angle (deg)")
@@ -411,8 +465,8 @@ def parse_args() -> argparse.Namespace:
         "--port",
         "--level-port",
         dest="level_port",
-        default="COM3",
-        help="PRO3600 Windows COM port. Default: COM3.",
+        default="COM4",
+        help="PRO3600 Windows COM port. Default: COM4.",
     )
     parser.add_argument("-b", "--baud", type=int, default=DEFAULT_BAUD, help="Baud rate. Default: 9600.")
     parser.add_argument("--bytesize", type=int, choices=(5, 6, 7, 8), default=8)

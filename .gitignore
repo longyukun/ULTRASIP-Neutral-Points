@@ -4,4 +4,5 @@ __pycache__/
 *.npy
 *.npz
 Data_Analysis_Visualization/batch_outputs/
+Instrument_Operation/calibration_outputs/
 Clarissa_Dissertation.pdf
