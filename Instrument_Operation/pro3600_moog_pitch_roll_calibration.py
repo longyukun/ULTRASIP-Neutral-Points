@@ -77,6 +77,9 @@ class Sample:
     angle_std_deg: float | None
     n_readings: int
     timestamp: str
+    commanded_pan_deg: float | None = None
+    actual_tilt_deg: float | None = None
+    commanded_tilt_deg: float | None = None
 
 
 def list_serial_ports() -> None:
@@ -202,7 +205,7 @@ class PRO3600Reader:
 
 
 class MoogBackend:
-    def move_pan(self, pan_deg: float) -> None:
+    def move_pan(self, pan_deg: float) -> tuple[float, float]:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -210,29 +213,44 @@ class MoogBackend:
 
 
 class DryRunMoog(MoogBackend):
-    def move_pan(self, pan_deg: float) -> None:
+    def __init__(self, tilt_deg: float) -> None:
+        self.tilt_deg = tilt_deg
+
+    def move_pan(self, pan_deg: float) -> tuple[float, float]:
         print(f"[dry-run] move Moog pan to {pan_deg:.1f} deg")
+        return pan_deg, self.tilt_deg
 
 
 class CommandMoog(MoogBackend):
-    def __init__(self, command_template: str) -> None:
+    def __init__(self, command_template: str, tilt_deg: float) -> None:
         self.command_template = command_template
+        self.tilt_deg = tilt_deg
 
-    def move_pan(self, pan_deg: float) -> None:
+    def move_pan(self, pan_deg: float) -> tuple[float, float]:
         command = self.command_template.format(pan=pan_deg)
         subprocess.run(command, shell=True, check=True)
+        return pan_deg, self.tilt_deg
 
 
 class MoogFunctionsMoog(MoogBackend):
     """Moog backend using Instrument_Operation/moog_functions.py directly."""
 
-    def __init__(self, port: str, tilt_deg: float, move_timeout: float) -> None:
+    def __init__(
+        self,
+        port: str,
+        tilt_deg: float,
+        move_timeout: float,
+        move_retries: int,
+        position_tolerance: float,
+    ) -> None:
         import moog_functions as mf
 
         self.mf = mf
         self.port = port
         self.tilt_deg = tilt_deg
         self.move_timeout = move_timeout
+        self.move_retries = move_retries
+        self.position_tolerance = position_tolerance
         self.serial_port = serial.Serial()
         self.serial_port.baudrate = 9600
         self.serial_port.port = port
@@ -243,17 +261,39 @@ class MoogFunctionsMoog(MoogBackend):
         status = self.mf.get_status_jog(self.serial_port, verbose=False)
         print(f"Moog opened on {port}: pan={status.pan_coord:.2f}, tilt={status.tilt_coord:.2f}")
 
-    def move_pan(self, pan_deg: float) -> None:
+    def _reconnect(self) -> None:
+        if self.serial_port.is_open:
+            self.serial_port.close()
+        time.sleep(0.5)
+        self.serial_port.open()
+        self.serial_port.reset_input_buffer()
+        self.serial_port.reset_output_buffer()
+        self.mf.init_autobaud(self.serial_port)
+
+    def move_pan(self, pan_deg: float) -> tuple[float, float]:
         target_pan = int(round(pan_deg * 10.0))
         target_tilt = int(round(self.tilt_deg * 10.0))
-        status = self.mf.move_to_coord_and_wait(
-            self.serial_port,
-            target_pan,
-            target_tilt,
-            timeout=self.move_timeout,
-            verbose=False,
-        )
+        for attempt in range(self.move_retries + 1):
+            try:
+                status = self.mf.move_to_coord_and_wait(
+                    self.serial_port,
+                    target_pan,
+                    target_tilt,
+                    timeout=self.move_timeout,
+                    position_tolerance=self.position_tolerance,
+                    verbose=False,
+                )
+                break
+            except TimeoutError:
+                if attempt >= self.move_retries:
+                    raise
+                print(
+                    "    Moog settle timeout; reconnecting and retrying "
+                    f"({attempt + 1}/{self.move_retries})..."
+                )
+                self._reconnect()
         print(f"    Moog actual pan={status.pan_coord:.2f}, tilt={status.tilt_coord:.2f}")
+        return float(status.pan_coord), float(status.tilt_coord)
 
     def close(self) -> None:
         if self.serial_port and self.serial_port.is_open:
@@ -262,15 +302,17 @@ class MoogFunctionsMoog(MoogBackend):
 
 def build_moog_backend(args: argparse.Namespace) -> MoogBackend:
     if args.moog_mode == "dry-run":
-        return DryRunMoog()
+        return DryRunMoog(args.tilt)
     if args.moog_mode == "command":
         if not args.moog_command:
             raise ValueError("--moog-command is required when --moog-mode command")
-        return CommandMoog(args.moog_command)
+        return CommandMoog(args.moog_command, args.tilt)
     return MoogFunctionsMoog(
         port=args.moog_port,
         tilt_deg=args.tilt,
         move_timeout=args.moog_move_timeout,
+        move_retries=args.moog_move_retries,
+        position_tolerance=args.moog_position_tolerance,
     )
 
 
@@ -390,14 +432,28 @@ def write_csv(path: Path, samples: list[Sample]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["cycle", "index", "pan_deg", "angle_deg", "angle_std_deg", "n_readings", "timestamp"]
+            [
+                "cycle",
+                "index",
+                "commanded_pan_deg",
+                "actual_pan_deg",
+                "commanded_tilt_deg",
+                "actual_tilt_deg",
+                "angle_deg",
+                "angle_std_deg",
+                "n_readings",
+                "timestamp",
+            ]
         )
         for sample in samples:
             writer.writerow(
                 [
                     sample.cycle,
                     sample.index,
+                    "" if sample.commanded_pan_deg is None else f"{sample.commanded_pan_deg:.6f}",
                     f"{sample.pan_deg:.6f}",
+                    "" if sample.commanded_tilt_deg is None else f"{sample.commanded_tilt_deg:.6f}",
+                    "" if sample.actual_tilt_deg is None else f"{sample.actual_tilt_deg:.6f}",
                     f"{sample.angle_deg:.6f}",
                     "" if sample.angle_std_deg is None else f"{sample.angle_std_deg:.6f}",
                     sample.n_readings,
@@ -442,7 +498,7 @@ def write_plot(path: Path, samples: list[Sample], fit: dict[str, float | list[in
             label="rejected outliers",
         )
     plt.plot(grid, fitted, color="black", linewidth=2, label="sinusoidal fit")
-    plt.xlabel("Moog pan angle (deg)")
+    plt.xlabel("Actual Moog pan angle (deg)")
     plt.ylabel("PRO3600 angle (deg)")
     plt.grid(True, alpha=0.3)
     plt.legend()
@@ -493,6 +549,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--moog-port", default=DEFAULT_MOOG_PORT, help=f"Moog Windows COM port. Default: {DEFAULT_MOOG_PORT}.")
     parser.add_argument("--moog-move-timeout", type=float, default=30.0, help="Max seconds to wait for each Moog move. Default: 30.")
+    parser.add_argument("--moog-move-retries", type=int, default=2, help="Reconnect and retry count after a Moog settle timeout. Default: 2.")
+    parser.add_argument("--moog-position-tolerance", type=float, default=0.6, help="Accepted Moog position error in degrees. Default: 0.6.")
     parser.add_argument(
         "--moog-command",
         help="Command template for --moog-mode command, for example: py move_moog.py --pan {pan}",
@@ -511,6 +569,10 @@ def main() -> None:
 
     if args.step <= 0 or 180 % args.step != 0:
         raise SystemExit("--step must be positive and divide 180 exactly.")
+    if args.moog_move_retries < 0:
+        raise SystemExit("--moog-move-retries must be non-negative.")
+    if args.moog_position_tolerance <= 0:
+        raise SystemExit("--moog-position-tolerance must be positive.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -540,7 +602,7 @@ def main() -> None:
         reader = PRO3600Reader(args)
         for index, (cycle, pan_deg) in enumerate(sequence, start=1):
             print(f"[{index}/{len(sequence)}] cycle={cycle} pan={pan_deg:.1f}")
-            moog.move_pan(pan_deg)
+            actual_pan_deg, actual_tilt_deg = moog.move_pan(pan_deg)
             time.sleep(args.settle)
             angle, stdev, n_readings = reader.sample(
                 args.sample_seconds,
@@ -550,11 +612,14 @@ def main() -> None:
             sample = Sample(
                 cycle=cycle,
                 index=index,
-                pan_deg=pan_deg,
+                pan_deg=actual_pan_deg,
                 angle_deg=angle,
                 angle_std_deg=stdev,
                 n_readings=n_readings,
                 timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                commanded_pan_deg=pan_deg,
+                actual_tilt_deg=actual_tilt_deg,
+                commanded_tilt_deg=args.tilt,
             )
             samples.append(sample)
             print(
@@ -569,8 +634,11 @@ def main() -> None:
         moog.close()
 
     fit = fit_pitch_roll(samples)
+    actual_tilts = [
+        sample.actual_tilt_deg for sample in samples if sample.actual_tilt_deg is not None
+    ]
     result = {
-        "fit_model": "level_angle_deg = offset_deg + pitch_deg*cos(pan_deg) + roll_deg*sin(pan_deg)",
+        "fit_model": "level_angle_deg = offset_deg + pitch_deg*cos(actual_pan_deg) + roll_deg*sin(actual_pan_deg)",
         "sign_note": "Pitch/roll signs depend on PRO3600 mounting direction.",
         "scan": {
             "step_deg": args.step,
@@ -578,9 +646,14 @@ def main() -> None:
             "settle_seconds": args.settle,
             "sample_seconds": args.sample_seconds,
             "tilt_deg": args.tilt,
+            "actual_tilt_mean_deg": statistics.mean(actual_tilts),
+            "actual_tilt_min_deg": min(actual_tilts),
+            "actual_tilt_max_deg": max(actual_tilts),
             "level_port": args.level_port,
             "moog_mode": args.moog_mode,
             "moog_port": args.moog_port if args.moog_mode == "moog-functions" else None,
+            "moog_move_retries": args.moog_move_retries,
+            "moog_position_tolerance_deg": args.moog_position_tolerance,
         },
         "fit": fit,
         "files": {
